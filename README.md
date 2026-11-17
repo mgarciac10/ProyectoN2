@@ -18,8 +18,8 @@ Despliegue del sitio web corporativo de **XYZ S.A.** (cosméticos) en **WordPres
                           ┌────────────┴────────────┐
                           │   Internet Gateway (IGW) │  NAT 1:1 IP pública ↔ IP privada
                           └────────────┬────────────┘
- VPC 10.0.0.0/16 (us-east-1)           │
-┌──────────── AZ us-east-1a ──────────────┐   ┌──────────── AZ us-east-1b ──────────────┐
+ VPC 10.0.0.0/16 (us-east-2)           │
+┌──────────── AZ us-east-2a ──────────────┐   ┌──────────── AZ us-east-2b ──────────────┐
 │ public-a 10.0.1.0/24   (0/0 → IGW)       │   │ public-b 10.0.2.0/24   (0/0 → IGW)       │
 │   xyz-ns1  BIND9 primario   10.0.1.10 EIP│◄─►│   xyz-ns2  BIND9 secundario 10.0.2.10 EIP│ AXFR/NOTIFY
 │   xyz-lb1  HAProxy          10.0.1.20 EIP│   │   xyz-lb2  HAProxy          10.0.2.20 EIP│
@@ -43,10 +43,10 @@ Despliegue del sitio web corporativo de **XYZ S.A.** (cosméticos) en **WordPres
 
 | Subred | CIDR | AZ | Tipo | Ruta por defecto |
 |---|---|---|---|---|
-| xyz-public-a | 10.0.1.0/24 | us-east-1a | Pública | 0.0.0.0/0 → IGW |
-| xyz-private-a | 10.0.11.0/24 | us-east-1a | Privada | 0.0.0.0/0 → ENI de xyz-nat-a |
-| xyz-public-b | 10.0.2.0/24 | us-east-1b | Pública | 0.0.0.0/0 → IGW |
-| xyz-private-b | 10.0.12.0/24 | us-east-1b | Privada | 0.0.0.0/0 → ENI de xyz-nat-b |
+| xyz-public-a | 10.0.1.0/24 | us-east-2a | Pública | 0.0.0.0/0 → IGW |
+| xyz-private-a | 10.0.11.0/24 | us-east-2a | Privada | 0.0.0.0/0 → ENI de xyz-nat-a |
+| xyz-public-b | 10.0.2.0/24 | us-east-2b | Pública | 0.0.0.0/0 → IGW |
+| xyz-private-b | 10.0.12.0/24 | us-east-2b | Privada | 0.0.0.0/0 → ENI de xyz-nat-b |
 
 Todas las tablas incluyen la ruta implícita `10.0.0.0/16 → local`.
 
@@ -54,11 +54,11 @@ Todas las tablas incluyen la ruta implícita `10.0.0.0/16 → local`.
 
 | Nombre | Rol | Subred | IP privada | IP pública | Instance ID |
 |---|---|---|---|---|---|
-| xyz-ns1 | DNS BIND9 primario | public-a | 10.0.1.10 | EIP | |
-| xyz-lb1 | Balanceador HAProxy | public-a | 10.0.1.20 | EIP | |
+| xyz-ns1 | DNS BIND9 primario | public-a | 10.0.1.10 | 3.134.251.219 (EIP) | |
+| xyz-lb1 | Balanceador HAProxy | public-a | 10.0.1.20 | 18.190.31.183 (EIP) | |
 | xyz-nat-a | NAT (nftables) | public-a | 10.0.1.30 | Automática | |
-| xyz-ns2 | DNS BIND9 secundario | public-b | 10.0.2.10 | EIP | |
-| xyz-lb2 | Balanceador HAProxy | public-b | 10.0.2.20 | EIP | |
+| xyz-ns2 | DNS BIND9 secundario | public-b | 10.0.2.10 | 3.131.134.77 (EIP) | |
+| xyz-lb2 | Balanceador HAProxy | public-b | 10.0.2.20 | 13.58.14.10 (EIP) | |
 | xyz-nat-b | NAT (nftables) | public-b | 10.0.2.30 | Automática | |
 | xyz-wp1 | WordPress | private-a | 10.0.11.10 | — | |
 | xyz-db | MariaDB + NFS | private-a | 10.0.11.20 | — | |
@@ -84,7 +84,7 @@ Salida: todo permitido (por defecto). **Ningún SG abre SSH (22)**: la administr
 
 | Decisión | Justificación |
 |---|---|
-| Región us-east-1, dos AZ | Menor costo; una AZ caída deja operativa la otra mitad (NAT, LB, DNS, WP). |
+| Región us-east-2, dos AZ | Región fija del proyecto AWS (nueva experiencia, asignada por país); una AZ caída deja operativa la otra mitad (NAT, LB, DNS, WP). |
 | t3.micro | Elegible en el plan gratuito; suficiente para carga académica. |
 | NAT propio por AZ | Requisito; además evita tráfico entre AZ y que una AZ dependa de la otra para salir a Internet. |
 | HAProxy | Health checks activos y página de estadísticas para evidenciar el balanceo. |
@@ -116,7 +116,58 @@ Con ~5 días de despliegue el costo esperado es ≈ 16 USD, dentro de los 100 US
 _(Por documentar: seguridad de la cuenta, cuotas, dominio.)_
 
 ### Fase 1 — Red base
-_(Por documentar.)_
+
+**VPC.** `xyz-vpc`, `10.0.0.0/16`, creada con la opción *VPC only* para controlar cada recurso a mano y evitar que el asistente cree un NAT Gateway, que el enunciado prohíbe. Tiene activados *DNS resolution* y *DNS hostnames*.
+
+**Subredes.** Se crearon las cuatro de la tabla 1.3. En `xyz-public-a` y `xyz-public-b` se activó *auto-assign public IPv4*, de modo que las instancias NAT reciben IP pública sin consumir Elastic IP. Las privadas no asignan IP pública. En cada /24, AWS reserva 5 direcciones (`.0` red, `.1` router de la VPC, `.2` DNS de AWS, `.3` reservada y `.255` broadcast), así que quedan 251 utilizables.
+
+**Direccionamiento privado e Internet Gateway.** Todas las subredes usan direcciones privadas RFC 1918. Lo que hace pública a una subred no es su rango, sino que su tabla de rutas envía `0.0.0.0/0` al IGW y que sus instancias tienen una IP pública asociada. Esa IP pública no está configurada en la instancia: el IGW traduce 1:1 entre IP pública e IP privada.
+
+**Internet Gateway.** `xyz-igw`, adjunto a `xyz-vpc`.
+
+**Tablas de rutas.**
+
+| Tabla | Subredes asociadas | Rutas |
+|---|---|---|
+| xyz-rt-public | xyz-public-a, xyz-public-b | 10.0.0.0/16 → local; 0.0.0.0/0 → xyz-igw |
+| xyz-rt-private-a | xyz-private-a | 10.0.0.0/16 → local (en la Fase 2 se agrega 0.0.0.0/0 → xyz-nat-a) |
+| xyz-rt-private-b | xyz-private-b | 10.0.0.0/16 → local (en la Fase 2 se agrega 0.0.0.0/0 → xyz-nat-b) |
+| main (sin nombre) | ninguna asociada explícitamente | 10.0.0.0/16 → local |
+
+Se usa una tabla privada por AZ para que cada subred privada salga por el NAT de su misma zona.
+
+**VPC por defecto.** La región trae una VPC default (`172.31.0.0/16`, una subred por AZ). Se deja sin usar; el proyecto no despliega nada en ella.
+
+Evidencia: `evidencias/fase1/resource-map-vpc.png`.
+
+**Security Groups** (todos en `xyz-vpc`; la regla de salida es la default, todo permitido):
+
+| SG | ID | Entrada |
+|---|---|---|
+| xyz-sg-lb | sg-0c9f84365bae19198 | TCP 80 desde 0.0.0.0/0 · TCP 8404 desde la IP del equipo · ICMP desde 0.0.0.0/0 |
+| xyz-sg-dns | sg-0bc2fea80ceaee124 | UDP/TCP 53 desde 0.0.0.0/0 · ICMP desde 0.0.0.0/0 |
+| xyz-sg-nat | sg-07f939b9f763c23c9 | Todo el tráfico desde 10.0.11.0/24 y 10.0.12.0/24 |
+| xyz-sg-wp | sg-0260dc2f52e738c66 | TCP 80 desde xyz-sg-lb · ICMP desde 10.0.0.0/16 |
+| xyz-sg-db | sg-00410bb2e8ec6b83c | TCP 3306 y TCP 2049 desde xyz-sg-wp · ICMP desde 10.0.0.0/16 |
+
+Los SG son *stateful*: el tráfico de respuesta de una conexión permitida pasa sin regla adicional. En wp y db el origen es otro SG (mínimo privilegio independiente de las IPs). El SG del NAT debe aceptar el tráfico de las subredes privadas porque los paquetes reenviados atraviesan su ENI. Ningún SG abre SSH.
+
+Evidencia: `evidencias/fase1/security-groups.png`.
+
+**Rol IAM.** `xyz-ec2-ssm-role` (entidad de confianza: EC2; política `AmazonSSMManagedInstanceCore`). Permite que el agente SSM se registre sin credenciales almacenadas en las instancias.
+
+**Elastic IPs** (se reservan antes de lanzar las instancias para conocer de antemano las IPs que van en los glue records y en los registros A):
+
+| Nombre | IPv4 pública | Allocation ID | Uso |
+|---|---|---|---|
+| xyz-eip-ns1 | 3.134.251.219 | eipalloc-04f4afdd13aefb7b8 | ns1 (glue record) |
+| xyz-eip-ns2 | 3.131.134.77 | eipalloc-0683a0cd8afb72253 | ns2 (glue record) |
+| xyz-eip-lb1 | 18.190.31.183 | eipalloc-0cce7e1847bcdb5ae | lb1 (registro A de www) |
+| xyz-eip-lb2 | 13.58.14.10 | eipalloc-075b3a1be9327354a | lb2 (registro A de www) |
+
+Evidencia: `evidencias/fase1/elastic-ips.png`.
+
+**Presupuesto.** Se creó en AWS Budgets un presupuesto mensual de 30 USD con alertas por correo.
 
 ### Fase 2 — NAT
 _(Por documentar.)_
