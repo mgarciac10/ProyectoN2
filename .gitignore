@@ -1,0 +1,16 @@
+# Archivos de contexto compartidos manualmente entre el equipo
+CLAUDE.md
+PROGRESS.md
+
+# Secretos (contraseñas de DB, salts de WordPress, credenciales AWS)
+secrets.env
+*.env
+*.pem
+*.key
+credentials*
+
+# Sistema / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
