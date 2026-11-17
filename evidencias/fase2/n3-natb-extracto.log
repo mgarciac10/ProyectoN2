@@ -1,0 +1,39 @@
+# Prueba N3: extracto de /var/tmp/n3-natb.log en xyz-nat-b (2026-11-17)
+# Comando: nstat -az IpInAddrErrors; sysctl -w net.ipv4.ip_forward=0;
+#          timeout 15 tcpdump -ni ens5 "host 10.0.12.10 and tcp port 80"
+# La captura completa tiene unos 330 paquetes. Aquí se conservan los tramos representativos.
+
+#kernel
+IpInAddrErrors                  721                0.0
+tcpdump: verbose output suppressed, use -v[v]... for full protocol decode
+listening on ens5, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+
+## --- Tramo 1: ip_forward = 0. Solo llegan SYN desde wp2; no hay SYN-ACK ni paquetes traducidos ---
+## curl intenta varias IPs de checkip.amazonaws.com en paralelo (separadas unos 200 ms) y retransmite cada SYN (mismo seq) a ~1 s
+21:06:13.781901 IP 10.0.12.10.58588 > 184.196.80.117.80: Flags [S], seq 4271406448, win 62727, options [mss 8961,sackOK,TS val 2728884671 ecr 0,nop,wscale 7], length 0
+21:06:13.983313 IP 10.0.12.10.54702 > 52.5.79.118.80: Flags [S], seq 3274930174, win 62727, options [mss 8961,sackOK,TS val 3175497154 ecr 0,nop,wscale 7], length 0
+21:06:14.183686 IP 10.0.12.10.37264 > 98.89.146.47.80: Flags [S], seq 1636041377, win 62727, options [mss 8961,sackOK,TS val 3656373395 ecr 0,nop,wscale 7], length 0
+21:06:14.384060 IP 10.0.12.10.35974 > 184.196.213.29.80: Flags [S], seq 1434595101, win 62727, options [mss 8961,sackOK,TS val 1948934740 ecr 0,nop,wscale 7], length 0
+21:06:14.584401 IP 10.0.12.10.53812 > 44.195.197.190.80: Flags [S], seq 1936502035, win 62727, options [mss 8961,sackOK,TS val 3499719397 ecr 0,nop,wscale 7], length 0
+21:06:14.784760 IP 10.0.12.10.35530 > 100.62.134.110.80: Flags [S], seq 1689099755, win 62727, options [mss 8961,sackOK,TS val 3538364429 ecr 0,nop,wscale 7], length 0
+21:06:14.845885 IP 10.0.12.10.58588 > 184.196.80.117.80: Flags [S], seq 4271406448, win 62727, options [mss 8961,sackOK,TS val 2728885735 ecr 0,nop,wscale 7], length 0
+21:06:15.869909 IP 10.0.12.10.58588 > 184.196.80.117.80: Flags [S], seq 4271406448, win 62727, options [mss 8961,sackOK,TS val 2728886759 ecr 0,nop,wscale 7], length 0
+...
+## (el mismo patrón se repite cada ~5 s, que es lo que tarda cada ciclo de curl: 3 s de timeout + 2 s de espera, hasta 21:07:26)
+...
+21:07:24.092182 IP 10.0.12.10.35558 > 18.213.44.71.80: Flags [S], seq 941042301, win 62727, options [mss 8961,sackOK,TS val 2208375320 ecr 0,nop,wscale 7], length 0
+21:07:25.117904 IP 10.0.12.10.35558 > 18.213.44.71.80: Flags [S], seq 941042301, win 62727, options [mss 8961,sackOK,TS val 2208376346 ecr 0,nop,wscale 7], length 0
+21:07:26.141884 IP 10.0.12.10.35558 > 18.213.44.71.80: Flags [S], seq 941042301, win 62727, options [mss 8961,sackOK,TS val 2208377370 ecr 0,nop,wscale 7], length 0
+
+## --- Tramo 2: ip_forward restaurado a 1 (a mano) hacia las 21:07:27. Vuelve la conexión completa ---
+21:07:30.517727 IP 10.0.12.10.41274 > 44.195.197.190.80: Flags [S], seq 3711083125, win 62727, options [mss 8961,sackOK,TS val 2238976345 ecr 0,nop,wscale 7], length 0
+21:07:30.529866 IP 44.195.197.190.80 > 10.0.12.10.41274: Flags [S.], seq 137368688, ack 3711083126, win 26847, options [mss 1460,sackOK,TS val 1392867165 ecr 2238976345,nop,wscale 8], length 0
+21:07:30.530142 IP 10.0.12.10.41274 > 44.195.197.190.80: Flags [.], ack 1, win 491, options [nop,nop,TS val 2238976358 ecr 1392867165], length 0
+21:07:30.530307 IP 10.0.12.10.41274 > 44.195.197.190.80: Flags [P.], seq 1:86, ack 1, win 491, options [nop,nop,TS val 2238976358 ecr 1392867165], length 85: HTTP: GET / HTTP/1.1
+21:07:30.542407 IP 44.195.197.190.80 > 10.0.12.10.41274: Flags [.], ack 86, win 105, options [nop,nop,TS val 1392867177 ecr 2238976358], length 0
+21:07:30.543241 IP 44.195.197.190.80 > 10.0.12.10.41274: Flags [P.], seq 1:255, ack 86, win 105, options [nop,nop,TS val 1392867178 ecr 2238976358], length 254: HTTP: HTTP/1.1 200
+21:07:30.543486 IP 10.0.12.10.41274 > 44.195.197.190.80: Flags [.], ack 255, win 490, options [nop,nop,TS val 2238976371 ecr 1392867178], length 0
+21:07:30.543658 IP 10.0.12.10.41274 > 44.195.197.190.80: Flags [F.], seq 86, ack 255, win 490, options [nop,nop,TS val 2238976371 ecr 1392867178], length 0
+21:07:30.555754 IP 44.195.197.190.80 > 10.0.12.10.41274: Flags [F.], seq 255, ack 87, win 105, options [nop,nop,TS val 1392867191 ecr 2238976371], length 0
+21:07:30.555971 IP 10.0.12.10.41274 > 44.195.197.190.80: Flags [.], ack 256, win 490, options [nop,nop,TS val 2238976384 ecr 1392867191], length 0
+## (el mismo intercambio completo se repite cada ~2 s hasta el final de la captura, 21:07:48)
