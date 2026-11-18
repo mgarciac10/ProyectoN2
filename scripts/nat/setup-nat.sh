@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Configura una instancia EC2 Ubuntu 24.04 como NAT (PAT/masquerade) con nftables.
+# Configura una instancia EC2 Ubuntu 26.04 LTS (válido para 24.04+) como NAT (PAT/masquerade) con nftables.
 # Uso (como root):  ./setup-nat.sh <nombre-host> <cidr-subred-privada>
 #   xyz-nat-a:  ./setup-nat.sh xyz-nat-a 10.0.11.0/24
 #   xyz-nat-b:  ./setup-nat.sh xyz-nat-b 10.0.12.0/24

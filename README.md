@@ -64,7 +64,7 @@ Todas las tablas incluyen la ruta implícita `10.0.0.0/16 → local`.
 | xyz-db | MariaDB + NFS | private-a | 10.0.11.20 | — | |
 | xyz-wp2 | WordPress | private-b | 10.0.12.10 | — | |
 
-Todas: Ubuntu Server 24.04 LTS, `t3.micro`, 8 GiB gp3, rol IAM `xyz-ec2-ssm-role`.
+Todas: Ubuntu Server 26.04 LTS (AMI Quick Start de Canonical; el enunciado exige 24.04 o superior), `t3.micro`, 8 GiB gp3, rol IAM `xyz-ec2-ssm-role`.
 
 ### 1.5 Grupos de seguridad (diseño)
 
@@ -86,6 +86,7 @@ Salida: todo permitido (por defecto). **Ningún SG abre SSH (22)**: la administr
 |---|---|
 | Región us-east-2, dos AZ | Región fija del proyecto AWS (nueva experiencia, asignada por país); una AZ caída deja operativa la otra mitad (NAT, LB, DNS, WP). |
 | t3.micro | Elegible en el plan gratuito; suficiente para carga académica. |
+| Ubuntu Server 26.04 LTS | Es la AMI de Ubuntu que ofrece por defecto el *Quick Start* de EC2. Cumple el requisito "24.04 o superior", es LTS (soporte estándar hasta 2031) y trae versiones recientes (p. ej. PHP 8.5; nftables como firewall por defecto). Las 9 instancias usan la misma AMI. |
 | NAT propio por AZ | Requisito; además evita tráfico entre AZ y que una AZ dependa de la otra para salir a Internet. |
 | HAProxy | Health checks activos y página de estadísticas para evidenciar el balanceo. |
 | Sin afinidad de sesión | Requisito B1: cada petición debe poder ir a cualquier nodo. |
@@ -181,7 +182,7 @@ Evidencia: `evidencias/fase1/elastic-ips.png`.
 
 ### Fase 2 — NAT
 
-**Instancias.** Se lanzaron `xyz-nat-a` (public-a, 10.0.1.30) y `xyz-nat-b` (public-b, 10.0.2.30): Ubuntu 24.04 LTS, t3.micro, sin key pair (acceso por SSM), SG `xyz-sg-nat`, IP pública automática y rol `xyz-ec2-ssm-role`.
+**Instancias.** Se lanzaron `xyz-nat-a` (public-a, 10.0.1.30) y `xyz-nat-b` (public-b, 10.0.2.30): Ubuntu 26.04 LTS, t3.micro, sin key pair (acceso por SSM), SG `xyz-sg-nat`, IP pública automática y rol `xyz-ec2-ssm-role`.
 
 **Source/Destination Check deshabilitado.** Por defecto, AWS descarta los paquetes cuyo destino (al entrar) o cuyo origen (al salir) no es la IP de la instancia. Un NAT reenvía tráfico ajeno, como paquetes de 10.0.11.10 hacia Internet, así que esa verificación tiene que estar apagada.
 
@@ -220,7 +221,7 @@ Evidencias: `evidencias/fase2/nat-a-nft-ruleset.png`, `nat-a-ip-forward.png`, `n
 
 **Dominio.** `xyzcosmetics.online`, registrado en GoDaddy.
 
-**Instancias.** `xyz-ns1` (public-a, 10.0.1.10, EIP 3.134.251.219) y `xyz-ns2` (public-b, 10.0.2.10, EIP 3.131.134.77): Ubuntu 24.04 LTS, t3.micro, SG `xyz-sg-dns` y rol `xyz-ec2-ssm-role`. La configuración se hizo con `scripts/bind/setup-bind.sh <primario|secundario> xyzcosmetics.online`.
+**Instancias.** `xyz-ns1` (public-a, 10.0.1.10, EIP 3.134.251.219) y `xyz-ns2` (public-b, 10.0.2.10, EIP 3.131.134.77): Ubuntu 26.04 LTS, t3.micro, SG `xyz-sg-dns` y rol `xyz-ec2-ssm-role`. La configuración se hizo con `scripts/bind/setup-bind.sh <primario|secundario> xyzcosmetics.online`.
 
 **Delegación pública (registrador).** En GoDaddy se configuraron dos cosas:
 
@@ -345,7 +346,56 @@ skip-name-resolve = 1
 Evidencias: `evidencias/fase4/db-setup-resumen.png`, `wp1-conexion-db.png`, `wp2-conexion-db.png`, `nfs-compartido-wp2.png`, `ns1-db-timeout.png`.
 
 ### Fase 5 — WordPress
-_(Por documentar.)_
+
+**Instancias.** `xyz-wp1` (private-a, 10.0.11.10) y `xyz-wp2` (private-b, 10.0.12.10), sin IP pública y con SG `xyz-sg-wp` (TCP 80 solo desde `xyz-sg-lb`). Se configuraron con `scripts/wordpress/setup-wordpress.sh`, un único archivo que incluye el mu-plugin y el contenido. Se ejecuta primero en wp1, que instala WordPress en la DB compartida, y después en wp2, que detecta la instalación existente y solo configura el nodo.
+
+**Pila de software:** Apache 2.4 con `mod_php` (PHP 8.5, MPM prefork) y WordPress **7.1.5** en español (`es_ES`), instalado con **WP-CLI**. El mismo código está en el disco local de cada nodo.
+
+**Estado compartido** (ver §1.7):
+
+| Elemento | Implementación |
+|---|---|
+| Base de datos | `DB_HOST = 10.0.11.20`, base `wordpress`, usuario `wpuser` (la contraseña solo está en `secrets.env` y en `wp-config.php`, con permisos `640 root:www-data`) |
+| Archivos subidos | `/etc/fstab`: `10.0.11.20:/srv/nfs/wp-uploads /var/www/wordpress/wp-content/uploads nfs4 defaults,_netdev,nofail,hard,timeo=600 0 0`. Montado con `vers=4.2,proto=tcp` |
+| Claves y salts | Las 8 constantes (`AUTH_KEY` … `NONCE_SALT`) se generan una vez en wp1 (`/root/xyz-wp-salts.txt`, `openssl rand`) y se copian a wp2. Con valores idénticos, la cookie de sesión firmada por un nodo es válida en el otro |
+
+**`wp-config.php`** (idéntico en ambos nodos):
+
+- **URL dinámica:** `WP_HOME`/`WP_SITEURL` = `http://` + la cabecera `Host` de la petición, solo si está en una lista blanca (`www`, dominio raíz, `tienda`, `lb1`, `lb2` y las EIP de los balanceadores). Cualquier otro valor usa `www.xyzcosmetics.online`, lo que evita la inyección de la cabecera `Host`. El sitio funciona igual al entrar por `www`, por `lb1` o por la IP de cualquiera de los balanceadores.
+- **`DISALLOW_FILE_MODS`** (activo salvo en WP-CLI) y **`AUTOMATIC_UPDATER_DISABLED`:** desde el panel no se pueden instalar ni actualizar plugins, temas, idiomas ni el núcleo. Un cambio así solo llegaría al nodo que atendió la petición y los nodos dejarían de ser iguales. Los cambios de código se hacen con el script, en ambos nodos.
+- **`WP_CACHE = false`** y sin plugins de caché.
+
+**Apache** (`/etc/apache2/sites-available/xyz-wordpress.conf`; se deshabilitó `000-default`):
+
+| Directiva | Propósito |
+|---|---|
+| Reglas `RewriteRule` de enlaces permanentes en el `VirtualHost`, `AllowOverride None` | Sin `.htaccess`, que es un archivo local y podría quedar distinto entre nodos. Las URL son `/nosotros/`, `/sedes/`, etc. |
+| `Header always set X-Served-By "xyz-wpN 10.0.1N.10"` | Identifica el nodo en todas las respuestas, incluidas las estáticas. Permite verificar el balanceo con `curl -I` |
+| `Header set Cache-Control "no-store"` | Ni el navegador ni un intermediario guardan la página, así que cada recarga pasa por el balanceador |
+| `php_admin_flag engine off` en `uploads` | Un `.php` subido nunca se ejecuta |
+| `LogFormat` con `%{X-Forwarded-For}i` | Registra la IP real del cliente detrás de HAProxy (Fase 6) |
+
+**mu-plugin `xyz-servidor.php`** (en `wp-content/mu-plugins`, se carga siempre y no se puede desactivar). Con el hook `wp_body_open` imprime en cada página una franja con el **nombre del nodo**, su **IPv4 privada** y la **hora de generación**. La hora prueba que la página se generó en esa petición y no salió de una caché. La IP se calcula en cada petición:
+
+1. `$_SERVER['SERVER_ADDR']`: la IP local en la que Apache recibió la conexión. Detrás de HAProxy es 10.0.11.10 o 10.0.12.10.
+2. Si esa IP es de loopback (`127.x`, en una prueba local), el plugin abre un socket UDP "conectado" hacia `10.0.0.2` (DNS de la VPC) y lee la IP de origen que elige el kernel. `connect()` en UDP no envía paquetes: solo resuelve la ruta y la interfaz de salida (`ens5`).
+
+**Contenido:** página de inicio estática "Inicio" y las páginas Nosotros, Productos, Sedes (Medellín, Bogotá y Bucaramanga) y Contacto. El título del sitio es "XYZ S.A." y la zona horaria `America/Bogota`. Se eliminaron la entrada y la página de ejemplo.
+
+**Verificación:**
+
+| Prueba | wp1 | wp2 |
+|---|---|---|
+| `wp core version` | 7.1.5 | 7.1.5 |
+| `findmnt …/uploads` | `10.0.11.20:/srv/nfs/wp-uploads nfs4 vers=4.2, clientaddr=10.0.11.10` | Ídem, `clientaddr=10.0.12.10` |
+| `wp post list --post_type=page` | IDs 4–8 publicados | Los mismos IDs (misma DB) |
+| `curl -I` local | `200 OK`, `X-Served-By: xyz-wp1 10.0.11.10`, `Cache-Control: no-store` | `200 OK`, `X-Served-By: xyz-wp2 10.0.12.10`, `Cache-Control: no-store` |
+| Franja del home | `Página servida por xyz-wp1 · IPv4 privada 10.0.11.10` | `Página servida por xyz-wp2 · IPv4 privada 10.0.12.10` |
+| `wp media import` en wp1 → `wp post list` + `ls -ln` en wp2 | Attachment ID 10 creado | wp2 lo ve en la DB y en disco: original + 3 miniaturas, dueño `33:33` |
+
+Las peticiones de prueba se hicieron con `curl` local en cada nodo (`-H "Host: www.xyzcosmetics.online" http://127.0.0.1/`), porque `xyz-sg-wp` solo admite tráfico desde los balanceadores.
+
+Evidencias: `evidencias/fase5/wp1-setup-resumen.png`, `wp2-setup-resumen.png`, `wp1-media-import.png`, `wp2-media-compartida.png` (y `*-v1.png`, antes de corregir P8).
 
 ### Fase 6 — Balanceadores HAProxy
 _(Por documentar.)_
@@ -506,6 +556,8 @@ _(Por documentar: IP, ICMP, TCP, DNS, HTTP, traducción NAT.)_
 | P4 | Durante N3, wp2 perdió Internet y la sesión SSM de forma indefinida | Se apagó `ip_forward` en nat-b y la sesión se cortó antes de ejecutar el comando que lo restauraba. La sesión SSM de wp2 también viaja por nat-b, así que se congeló | Se restauró `ip_forward=1` desde nat-b, cuya sesión SSM sale directo por el IGW y no depende del forwarding. Lección: las pruebas que cortan conectividad deben ejecutarse desacopladas de la sesión (`nohup`), restaurar el servicio solas y escribir sus resultados en disco (`/var/tmp`, que sobrevive a reinicios) |
 | P5 | En N3, `timeout 15 tcpdump` no se detuvo a los 15 s dentro del bloque `sudo nohup bash -c … &`, así que el `sysctl -w net.ipv4.ip_forward=1` automático nunca se ejecutó y el corte duró unos 75 s | No se determinó la causa exacta (tcpdump ejecutado en segundo plano a través de sudo/nohup/timeout) | Se restauró el forwarding a mano y se detuvo tcpdump. Lección: en pruebas destructivas, restaurar con un mecanismo independiente de la captura (por ejemplo, `sleep 15; sysctl -w …=1` en un proceso aparte, o `tcpdump -G 15 -W 1`) y comprobar siempre el estado final |
 | P6 | ns2 registraba `refused notify from non-primary: 3.131.134.77` justo después de cada transferencia | Tras un AXFR, un secundario notifica a los NS de la zona, excepto al MNAME del SOA y a sus propias direcciones. ns2 solo conoce su IP privada, no su EIP (la traduce el IGW), así que se notificaba a sí mismo por la EIP y luego rechazaba el aviso por no venir de 10.0.1.10 | `notify no;` en la zona secundaria. En el primario, `notify explicit` + `also-notify` hacia la IP privada. Lección: con NAT 1:1 (EIP) la instancia desconoce su IP pública, así que la comunicación interna entre servidores debe usar IPs privadas |
+| P7 | `wp core download --locale=es_ES` fallaba con `The requested locale (es_ES) was not found` | Para la versión más reciente (7.1.5), la API de WordPress solo ofrecía el paquete completo en `en_US`, aunque el paquete de idioma `es_ES` sí existía | Descargar la versión base y luego `wp language core install es_ES --activate` en cada nodo (los `.mo` son locales; la opción `WPLANG` va en la DB). `DISALLOW_FILE_MODS` se limita al panel web para que WP-CLI pueda instalar el idioma |
+| P8 | La franja del home mostraba `IPv4 privada 127.0.0.1` | La prueba local se conectaba a 127.0.0.1, y `SERVER_ADDR` es la dirección local de esa conexión | Si `SERVER_ADDR` es loopback, el mu-plugin obtiene la IP de la interfaz de salida con un socket UDP conectado a 10.0.0.2. Lección: la IP "del servidor" depende de por cuál interfaz llegó la conexión |
 
 ## 6. Referencias
 _(Formato IEEE; se agregan a medida que se usan.)_

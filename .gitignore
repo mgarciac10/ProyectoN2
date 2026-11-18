@@ -4,6 +4,7 @@ PROGRESS.md
 
 # Secretos (contraseñas de DB, salts de WordPress, credenciales AWS)
 secrets.env
+*salts*.txt
 *.env
 *.pem
 *.key
