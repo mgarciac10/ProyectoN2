@@ -95,7 +95,17 @@ Salida: todo permitido (por defecto). **Ningún SG abre SSH (22)**: la administr
 | SSM en lugar de SSH | Requisito; no se exponen puertos de administración. Las privadas alcanzan los endpoints de SSM a través de su NAT. |
 
 ### 1.7 Punto único de falla y estado compartido
-_(Por completar en Fase 4–5.)_ La instancia `xyz-db` concentra la base de datos y los archivos subidos. Si falla, ambos WordPress dejan de servir contenido dinámico aunque los balanceadores y el DNS sigan operativos. Mitigaciones fuera de alcance: réplica MariaDB, Amazon RDS Multi-AZ, EFS/S3 para medios.
+
+Para que dos nodos WordPress sirvan el mismo sitio, todo su **estado** debe estar fuera de ellos o ser idéntico en ambos:
+
+| Estado | Dónde vive | Cómo se comparte |
+|---|---|---|
+| Contenido (páginas, entradas, usuarios, opciones, sesiones de login) | MariaDB en `xyz-db` | Ambos nodos usan la misma base `wordpress` |
+| Archivos subidos (`wp-content/uploads`) | `/srv/nfs/wp-uploads` en `xyz-db` | Montaje NFSv4 en ambos nodos |
+| Claves y salts (`AUTH_KEY`, …) | `wp-config.php` de cada nodo | Valores **idénticos** en ambos, para que la cookie emitida por un nodo sea válida en el otro |
+| Código de WordPress, temas y plugins | Disco local de cada nodo | Misma versión instalada por el mismo script |
+
+**Punto único de falla:** `xyz-db` concentra la base de datos y los archivos. Si falla, ambos WordPress dejan de servir contenido dinámico, aunque el DNS, los balanceadores y los nodos web sigan en pie. Además, la DB está en la AZ `us-east-2a`: una falla de esa zona afecta al sitio completo, aunque wp2 y lb2 estén en `us-east-2b`. La redundancia del diseño cubre la capa de presentación (DNS, LB, web), no la de datos. Mitigaciones fuera de alcance: replicación MariaDB primario/réplica (o Galera) en la otra AZ, Amazon RDS Multi-AZ, Amazon EFS o S3 para los medios, y copias de seguridad programadas (`mariadb-dump` + snapshots EBS).
 
 ### 1.8 Estimación de costos
 
@@ -283,7 +293,56 @@ Log de ns2 al arrancar: `Transfer started` → `transfer of 'xyzcosmetics.online
 Evidencias: `evidencias/fase3/godaddy-hostnames-glue.png`, `godaddy-nameservers.png`, `tld-delegacion-dig.png`, `tld-delegacion.txt`, `ns1-soa.png`, `ns1-ns.png`, `ns1-www.png`, `ns1-tienda-cname.png`, `ns2-soa.png`, `ns2-www.png`, `axfr-denegado-y-sin-recursion.png`, `ns2-transferencia-zona.txt`.
 
 ### Fase 4 — Base de datos y NFS
-_(Por documentar.)_
+
+**Instancia.** `xyz-db` (private-a, 10.0.11.20, sin IP pública, SG `xyz-sg-db`). Accede a Internet (paquetes y SSM) a través de nat-a. La configuración se hizo con `scripts/db/setup-db.sh`. La contraseña de `wpuser` se pide por teclado y se guarda solo en `secrets.env` (no versionado; plantilla en `secrets.env.example`).
+
+**MariaDB** (`/etc/mysql/mariadb.conf.d/60-xyz.cnf`, que se lee después de `50-server.cnf` y sobrescribe sus valores):
+
+```
+[mysqld]
+bind-address      = 10.0.11.20
+skip-name-resolve = 1
+```
+
+- `bind-address`: por defecto MariaDB solo escucha en 127.0.0.1. Se configura en la IP privada (no en `0.0.0.0`).
+- `skip-name-resolve`: autoriza por IP, sin hacer DNS inverso de cada cliente.
+- Base `wordpress` (`utf8mb4`). Se crea el usuario `wpuser` **dos veces**, `wpuser@10.0.11.10` y `wpuser@10.0.12.10`, con `ALL PRIVILEGES` solo sobre `wordpress.*`. MariaDB identifica a un usuario por *nombre + host de origen*, así que desde cualquier otra IP el usuario no existe.
+- `root` conserva la autenticación `unix_socket`: solo entra con `sudo mariadb` desde la propia instancia. Se eliminan los usuarios anónimos y la base `test`.
+
+**NFS (NFSv4)** — `/etc/exports`:
+
+```
+/srv/nfs/wp-uploads 10.0.11.10(rw,sync,no_subtree_check,all_squash,anonuid=33,anongid=33) \
+                    10.0.12.10(rw,sync,no_subtree_check,all_squash,anonuid=33,anongid=33)
+```
+
+| Opción | Efecto |
+|---|---|
+| `rw,sync` | Escritura, confirmada en disco antes de responder al cliente |
+| `all_squash,anonuid=33,anongid=33` | Toda escritura, incluso la de root del cliente, queda a nombre de `www-data` (uid/gid 33). Los archivos que sube wp1 se pueden leer y modificar desde wp2 |
+| `no_subtree_check` | Recomendado al exportar un directorio completo; evita errores cuando se renombran archivos abiertos |
+| `nfsconf --set nfsd vers3 n` | Solo NFSv4 (`-3 +4 +4.1 +4.2`): todo el tráfico va por **TCP 2049**. NFSv3 requeriría además rpcbind (111) y `mountd` en puertos dinámicos, difíciles de filtrar con Security Groups |
+
+**Tres capas de control de acceso a la DB:**
+
+| Capa | 3306 (MariaDB) | 2049 (NFS) |
+|---|---|---|
+| Security Group `xyz-sg-db` | Solo desde instancias con `xyz-sg-wp` | Solo desde instancias con `xyz-sg-wp` |
+| Servicio | `wpuser` solo existe para 10.0.11.10 y 10.0.12.10 | `/etc/exports` solo para 10.0.11.10 y 10.0.12.10 |
+| Red | Subred privada sin IP pública: no es direccionable desde Internet | Ídem |
+
+**Verificación:**
+
+| Prueba | Desde | Resultado |
+|---|---|---|
+| Puertos en escucha | xyz-db | `10.0.11.20:3306` (mariadbd) y `*:2049` (nfsd) |
+| `nc -zv 10.0.11.20 3306` / `2049` | wp1 y wp2 | `succeeded` |
+| `SELECT CURRENT_USER(), @@hostname` | wp1 | `wpuser@10.0.11.10`, `xyz-db`; bases `information_schema` y `wordpress` |
+| ídem | wp2 | `wpuser@10.0.12.10`, `xyz-db` |
+| Archivo escrito en wp1, leído en wp2 por NFS | wp2 | `escrito desde xyz-wp1`, propietario `33 33` aunque se escribió con `sudo` (efecto de `all_squash`) |
+| `nc -zv -w 5 10.0.11.20 3306` | xyz-ns1 (SG `xyz-sg-dns`) | `timed out`: el SG descarta el SYN en silencio (no hay RST) |
+
+Evidencias: `evidencias/fase4/db-setup-resumen.png`, `wp1-conexion-db.png`, `wp2-conexion-db.png`, `nfs-compartido-wp2.png`, `ns1-db-timeout.png`.
 
 ### Fase 5 — WordPress
 _(Por documentar.)_
