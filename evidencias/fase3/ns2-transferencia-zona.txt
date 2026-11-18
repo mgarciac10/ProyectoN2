@@ -1,0 +1,31 @@
+# xyz-ns2 — sudo journalctl -u named --no-pager | grep -iE "transfer|notify"
+Nov 18 21:12:12 xyz-ns2 named[1906]: zone xyzcosmetics.online/IN: Transfer started.
+Nov 18 21:12:12 xyz-ns2 named[1906]: 0x785412750000: transfer of 'xyzcosmetics.online/IN' from 10.0.1.10#53: connected using 10.0.1.10#53
+Nov 18 21:12:12 xyz-ns2 named[1906]: zone xyzcosmetics.online/IN: transferred serial 2026111801
+Nov 18 21:12:12 xyz-ns2 named[1906]: 0x785412750000: transfer of 'xyzcosmetics.online/IN' from 10.0.1.10#53: Transfer status: success
+Nov 18 21:12:12 xyz-ns2 named[1906]: 0x785412750000: transfer of 'xyzcosmetics.online/IN' from 10.0.1.10#53: Transfer completed: 1 messages, 13 records, 323 bytes, 0.002 secs (161500 bytes/sec) (serial 2026111801)
+Nov 18 21:12:12 xyz-ns2 named[1906]: zone xyzcosmetics.online/IN: sending notify to 3.131.134.77#53
+Nov 18 21:12:12 xyz-ns2 named[1906]: client @0x785414b20000 3.131.134.77#43650: received notify for zone 'xyzcosmetics.online'
+Nov 18 21:12:12 xyz-ns2 named[1906]: zone xyzcosmetics.online/IN: refused notify from non-primary: 3.131.134.77#43650
+Nov 18 21:15:21 xyz-ns2 named[1906]: client @0x785414b21c00 190.158.28.42#18706 (xyzcosmetics.online): zone transfer 'xyzcosmetics.online/AXFR/IN' denied
+
+# xyz-ns2 — sudo cat /var/cache/bind/db.xyzcosmetics.online
+$TTL 300        ; 5 minutes
+xyzcosmetics.online.    IN SOA  ns1.xyzcosmetics.online. admin.xyzcosmetics.online. (
+                                2026111801 ; serial
+                                3600       ; refresh (1 hour)
+                                600        ; retry (10 minutes)
+                                604800     ; expire (1 week)
+                                300        ; minimum (5 minutes)
+                                )
+                        NS      ns1.xyzcosmetics.online.
+                        NS      ns2.xyzcosmetics.online.
+                        A       13.58.14.10
+                        A       18.190.31.183
+lb1.xyzcosmetics.online. A      18.190.31.183
+lb2.xyzcosmetics.online. A      13.58.14.10
+ns1.xyzcosmetics.online. A      3.134.251.219
+ns2.xyzcosmetics.online. A      3.131.134.77
+tienda.xyzcosmetics.online. CNAME www.xyzcosmetics.online.
+www.xyzcosmetics.online. A      13.58.14.10
+                        A       18.190.31.183

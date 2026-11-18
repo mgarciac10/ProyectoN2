@@ -1,0 +1,5 @@
+# PC del equipo — nslookup -type=NS -norecurse xyzcosmetics.online ns10.trs-dns.org  (2026-11-18)
+xyzcosmetics.online	nameserver = ns1.xyzcosmetics.online
+xyzcosmetics.online	nameserver = ns2.xyzcosmetics.online
+ns1.xyzcosmetics.online	internet address = 3.134.251.219
+ns2.xyzcosmetics.online	internet address = 3.131.134.77

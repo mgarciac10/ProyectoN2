@@ -207,7 +207,80 @@ table ip nat {
 Evidencias: `evidencias/fase2/nat-a-nft-ruleset.png`, `nat-a-ip-forward.png`, `nat-b-nft-ruleset.png`, `nat-b-ip-forward.png`, `rt-private-a-routes.png`.
 
 ### Fase 3 — DNS BIND9
-_(Por documentar.)_
+
+**Dominio.** `xyzcosmetics.online`, registrado en GoDaddy.
+
+**Instancias.** `xyz-ns1` (public-a, 10.0.1.10, EIP 3.134.251.219) y `xyz-ns2` (public-b, 10.0.2.10, EIP 3.131.134.77): Ubuntu 24.04 LTS, t3.micro, SG `xyz-sg-dns` y rol `xyz-ec2-ssm-role`. La configuración se hizo con `scripts/bind/setup-bind.sh <primario|secundario> xyzcosmetics.online`.
+
+**Delegación pública (registrador).** En GoDaddy se configuraron dos cosas:
+
+1. **Hostnames (glue records):** `ns1` → 3.134.251.219 y `ns2` → 3.131.134.77. Los nameservers están *dentro* de la zona que delegan (dependencia circular: para hallar `ns1.xyzcosmetics.online` habría que preguntarle a `ns1`). El glue hace que el TLD entregue sus IPs junto con la delegación.
+2. **Nameservers personalizados:** `ns1.xyzcosmetics.online` y `ns2.xyzcosmetics.online`.
+
+El servidor del TLD `.online` (`ns10.trs-dns.org`) responde **sin** el flag `aa`, porque no es autoritativo para la zona. En la sección AUTHORITY entrega los dos NS y en ADDITIONAL los glue, con un TTL de 900 s fijado por el registro del TLD.
+
+**Opciones globales** (`/etc/bind/named.conf.options`, iguales en ambos servidores):
+
+| Opción | Valor | Motivo |
+|---|---|---|
+| `listen-on` | `127.0.0.1` + IP privada | `systemd-resolved` ya ocupa `127.0.0.53:53`. Las consultas de Internet llegan a la IP privada porque el IGW traduce 1:1 EIP ↔ IP privada |
+| `listen-on-v6` / `-4` | `none` / `OPTIONS="-u bind -4"` | La VPC no tiene IPv6 |
+| `recursion` | `no` | Servidor solo autoritativo: no puede usarse como resolvedor abierto ni para amplificación |
+| `allow-transfer` | `none` (global) | Nadie puede pedir la zona completa, salvo lo que cada zona permita |
+| `version` | `"no disponible"` | Oculta la versión de BIND (`dig CH TXT version.bind`) |
+
+**Zona primaria** (`/etc/bind/zones/db.xyzcosmetics.online` en ns1):
+
+```
+$TTL 300
+@       IN SOA ns1.xyzcosmetics.online. admin.xyzcosmetics.online. (
+            2026111801 ; serial AAAAMMDDNN
+            3600       ; refresh
+            600        ; retry
+            604800     ; expire
+            300 )      ; TTL negativo
+@       IN NS    ns1.xyzcosmetics.online.
+@       IN NS    ns2.xyzcosmetics.online.
+ns1     IN A     3.134.251.219
+ns2     IN A     3.131.134.77
+lb1     IN A     18.190.31.183
+lb2     IN A     13.58.14.10
+www     IN A     18.190.31.183     ; DNS Round Robin:
+www     IN A     13.58.14.10       ; dos A para www
+@       IN A     18.190.31.183
+@       IN A     13.58.14.10
+tienda  IN CNAME www
+```
+
+- **TTL de 300 s:** los cambios (D2) y la caída de un balanceador (D5) se reflejan en minutos en las cachés.
+- **SOA:** el secundario revisa el serial cada hora (`refresh`), reintenta cada 10 min si el primario no responde (`retry`) y sigue respondiendo hasta 7 días sin primario (`expire`, relevante para D3).
+- **`www` con dos A:** cada cliente recibe ambas IPs de los balanceadores y elige una. Es la base del reparto de carga por DNS.
+
+**Primario/secundario y transferencia de zona.**
+
+| | ns1 (primario) | ns2 (secundario) |
+|---|---|---|
+| Declaración | `type primary; file "/etc/bind/zones/db.…";` | `type secondary; primaries { 10.0.1.10; }; file "/var/cache/bind/db.…"; masterfile-format text;` |
+| AXFR | `allow-transfer { 10.0.2.10; };` | `allow-transfer { none; };` |
+| NOTIFY | `notify explicit; also-notify { 10.0.2.10; };` | `notify no;` |
+
+La transferencia y el NOTIFY usan las **IPs privadas** (red local de la VPC). Si se usaran los NS de la zona, el tráfico iría a la EIP, saldría por el IGW con la EIP del remitente como origen, y el secundario lo rechazaría por no venir de su primario declarado (ver problema P6). `masterfile-format text` deja legible la copia del secundario, que por defecto se guarda en formato binario `raw`.
+
+Log de ns2 al arrancar: `Transfer started` → `transfer of 'xyzcosmetics.online/IN' from 10.0.1.10#53: connected using 10.0.1.10#53` → `Transfer completed: 1 messages, 13 records, 323 bytes` → `transferred serial 2026111801`.
+
+**Verificación** (desde un PC externo, con `+norec` para exigir una respuesta autoritativa):
+
+| Consulta | Servidor | Resultado |
+|---|---|---|
+| `xyzcosmetics.online SOA` | ns1 y ns2 | `flags: qr aa`, serial **2026111801** en ambos |
+| `xyzcosmetics.online NS` | ns1 | ns1 y ns2; sus A como datos adicionales |
+| `www.xyzcosmetics.online A` | ns1 y ns2 | **2 registros A**: 18.190.31.183 y 13.58.14.10 |
+| `tienda.xyzcosmetics.online A` | ns1 | `CNAME www.xyzcosmetics.online.` + los dos A (el autoritativo resuelve el alias dentro de su zona) |
+| `xyzcosmetics.online AXFR` | ns1 y ns2 | `Transfer failed`. En ns2 queda el log `zone transfer … denied` para la IP del cliente |
+| `google.com A` | ns1 | `status: REFUSED`, `recursion requested but not available`, `EDE 20 (Not Authoritative)` |
+| `xyzcosmetics.online NS` | `ns10.trs-dns.org` (TLD) | Delegación a ns1/ns2 con glue (sin `aa`) |
+
+Evidencias: `evidencias/fase3/godaddy-hostnames-glue.png`, `godaddy-nameservers.png`, `tld-delegacion-dig.png`, `tld-delegacion.txt`, `ns1-soa.png`, `ns1-ns.png`, `ns1-www.png`, `ns1-tienda-cname.png`, `ns2-soa.png`, `ns2-www.png`, `axfr-denegado-y-sin-recursion.png`, `ns2-transferencia-zona.txt`.
 
 ### Fase 4 — Base de datos y NFS
 _(Por documentar.)_
@@ -373,6 +446,7 @@ _(Por documentar: IP, ICMP, TCP, DNS, HTTP, traducción NAT.)_
 | P3 | En N3 y N4, los comandos de `sysctl`/`tcpdump` no surtían efecto | Las sesiones de SSM Session Manager entran como `ssm-user`, no como root | Anteponer `sudo` a los comandos administrativos |
 | P4 | Durante N3, wp2 perdió Internet y la sesión SSM de forma indefinida | Se apagó `ip_forward` en nat-b y la sesión se cortó antes de ejecutar el comando que lo restauraba. La sesión SSM de wp2 también viaja por nat-b, así que se congeló | Se restauró `ip_forward=1` desde nat-b, cuya sesión SSM sale directo por el IGW y no depende del forwarding. Lección: las pruebas que cortan conectividad deben ejecutarse desacopladas de la sesión (`nohup`), restaurar el servicio solas y escribir sus resultados en disco (`/var/tmp`, que sobrevive a reinicios) |
 | P5 | En N3, `timeout 15 tcpdump` no se detuvo a los 15 s dentro del bloque `sudo nohup bash -c … &`, así que el `sysctl -w net.ipv4.ip_forward=1` automático nunca se ejecutó y el corte duró unos 75 s | No se determinó la causa exacta (tcpdump ejecutado en segundo plano a través de sudo/nohup/timeout) | Se restauró el forwarding a mano y se detuvo tcpdump. Lección: en pruebas destructivas, restaurar con un mecanismo independiente de la captura (por ejemplo, `sleep 15; sysctl -w …=1` en un proceso aparte, o `tcpdump -G 15 -W 1`) y comprobar siempre el estado final |
+| P6 | ns2 registraba `refused notify from non-primary: 3.131.134.77` justo después de cada transferencia | Tras un AXFR, un secundario notifica a los NS de la zona, excepto al MNAME del SOA y a sus propias direcciones. ns2 solo conoce su IP privada, no su EIP (la traduce el IGW), así que se notificaba a sí mismo por la EIP y luego rechazaba el aviso por no venir de 10.0.1.10 | `notify no;` en la zona secundaria. En el primario, `notify explicit` + `also-notify` hacia la IP privada. Lección: con NAT 1:1 (EIP) la instancia desconoce su IP pública, así que la comunicación interna entre servidores debe usar IPs privadas |
 
 ## 6. Referencias
 _(Formato IEEE; se agregan a medida que se usan.)_
