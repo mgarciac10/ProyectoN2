@@ -54,15 +54,15 @@ Todas las tablas incluyen la ruta implícita `10.0.0.0/16 → local`.
 
 | Nombre | Rol | Subred | IP privada | IP pública | Instance ID |
 |---|---|---|---|---|---|
-| xyz-ns1 | DNS BIND9 primario | public-a | 10.0.1.10 | 3.134.251.219 (EIP) | |
-| xyz-lb1 | Balanceador HAProxy | public-a | 10.0.1.20 | 18.190.31.183 (EIP) | |
-| xyz-nat-a | NAT (nftables) | public-a | 10.0.1.30 | Automática | |
-| xyz-ns2 | DNS BIND9 secundario | public-b | 10.0.2.10 | 3.131.134.77 (EIP) | |
-| xyz-lb2 | Balanceador HAProxy | public-b | 10.0.2.20 | 13.58.14.10 (EIP) | |
-| xyz-nat-b | NAT (nftables) | public-b | 10.0.2.30 | Automática | |
-| xyz-wp1 | WordPress | private-a | 10.0.11.10 | — | |
-| xyz-db | MariaDB + NFS | private-a | 10.0.11.20 | — | |
-| xyz-wp2 | WordPress | private-b | 10.0.12.10 | — | |
+| xyz-ns1 | DNS BIND9 primario | public-a | 10.0.1.10 | 3.134.251.219 (EIP) | `i-016e94435b5dc5f0f` |
+| xyz-lb1 | Balanceador HAProxy | public-a | 10.0.1.20 | 18.190.31.183 (EIP) | `i-0cf9c37d19eeb7b64` |
+| xyz-nat-a | NAT (nftables) | public-a | 10.0.1.30 | 3.128.168.127 (automática) | `i-0e9ad2248a4fa9fc1` |
+| xyz-ns2 | DNS BIND9 secundario | public-b | 10.0.2.10 | 3.131.134.77 (EIP) | `i-0ff8c50a0b9d12536` |
+| xyz-lb2 | Balanceador HAProxy | public-b | 10.0.2.20 | 13.58.14.10 (EIP) | `i-0c61ff216ed4a27fb` |
+| xyz-nat-b | NAT (nftables) | public-b | 10.0.2.30 | 3.17.143.42 (automática) | `i-01f8ddaa75f967797` |
+| xyz-wp1 | WordPress | private-a | 10.0.11.10 | — | `i-052cd6e9a86b0cf57` |
+| xyz-db | MariaDB + NFS | private-a | 10.0.11.20 | — | `i-02be960ca2dc2e1bb` |
+| xyz-wp2 | WordPress | private-b | 10.0.12.10 | — | `i-061324fe87f5417c6` |
 
 Todas: Ubuntu Server 26.04 LTS (AMI Quick Start de Canonical; el enunciado exige 24.04 o superior), `t3.micro`, 8 GiB gp3, rol IAM `xyz-ec2-ssm-role`.
 
@@ -398,7 +398,27 @@ Las peticiones de prueba se hicieron con `curl` local en cada nodo (`-H "Host: w
 Evidencias: `evidencias/fase5/wp1-setup-resumen.png`, `wp2-setup-resumen.png`, `wp1-media-import.png`, `wp2-media-compartida.png` (y `*-v1.png`, antes de corregir P8).
 
 ### Fase 6 — Balanceadores HAProxy
-_(Por documentar.)_
+
+**Instancias.** `xyz-lb1` (public-a, 10.0.1.20, EIP 18.190.31.183) y `xyz-lb2` (public-b, 10.0.2.20, EIP 13.58.14.10): Ubuntu 26.04 LTS, `t3.micro`, sin key pair (acceso por SSM), SG `xyz-sg-lb`, rol `xyz-ec2-ssm-role`. Con ellas se completan las **9 instancias** (18 de los 20 vCPU de la cuota). Se lanzaron clonando `xyz-ns1` y `xyz-ns2` (misma subred pública, AMI y rol) y cambiando nombre, SG e IP privada fija; la EIP se asoció después. Se configuraron con `scripts/haproxy/setup-haproxy.sh` (HAProxy 3.2.25), que identifica el nodo por su IP privada y pide la contraseña de la página de estadísticas (no se guarda en el repositorio).
+
+**Configuración** (`/etc/haproxy/haproxy.cfg`, igual en ambos salvo el nombre):
+
+| Directiva | Propósito |
+|---|---|
+| `frontend http_in` · `bind *:80` | Recibe las peticiones HTTP de los clientes (SG: TCP 80 desde 0.0.0.0/0) |
+| `backend wordpress` · `balance roundrobin` | Reparte las peticiones alternando wp1 y wp2. **Sin cookies ni `balance source`**: no hay afinidad de sesión (requisito de B1) |
+| `option httpchk` + `http-check send meth GET uri / ver HTTP/1.1 hdr Host www.xyzcosmetics.online` + `http-check expect status 200` | Health check de capa 7: pide la página de inicio de WordPress (que también consulta la DB) y exige un 200 |
+| `default-server inter 2s fall 2 rise 2` | Verifica cada 2 s; marca `DOWN` tras 2 fallos seguidos y `UP` tras 2 aciertos (detección en unos 4–6 s) |
+| `option redispatch` + `retries 3` | Si el servidor elegido falla al conectar, reintenta la petición en el otro |
+| `option forwardfor` | Agrega `X-Forwarded-For` con la IP real del cliente (Apache la registra, Fase 5) |
+| `http-response set-header X-Balanced-By xyz-lbN` | Identifica el balanceador que respondió; junto con `X-Served-By` (de Apache) muestra el camino completo en `curl -I` |
+| `listen stats` · `bind *:8404` · `stats auth admin:…` | Página de estadísticas con usuario y contraseña. El SG `xyz-sg-lb` solo permite el 8404 desde la IP del equipo (/32) |
+
+**Flujo.** HAProxy actúa como *proxy inverso*: termina la conexión TCP del cliente (cliente ↔ LB) y abre **otra** conexión TCP hacia el WordPress elegido (LB ↔ wp, `xyz-sg-wp` solo admite TCP 80 desde `xyz-sg-lb`). Por eso los servidores privados nunca son direccionables desde Internet y cada balanceador solo necesita su EIP.
+
+**Verificación.** El script imprime un resumen: HAProxy `active`, escuchando en `0.0.0.0:80` y `0.0.0.0:8404`, wp1 y wp2 responden `200` por conexión directa, y 4 peticiones locales alternan `x-served-by: xyz-wp1 10.0.11.10` / `xyz-wp2 10.0.12.10` con `x-balanced-by` del propio nodo.
+
+Evidencias: `evidencias/fase6/lb1-setup-resumen.png`, `lb2-setup-resumen.png`, `ec2-9-instancias.png`, `ssm-9-nodos-online.png`.
 
 ---
 
@@ -417,8 +437,8 @@ Para cada prueba: procedimiento, comandos, evidencia, interpretación y protocol
 | D3 | Primario caído; secundario responde autoritativamente | Pendiente |
 | D4 | Consultas repetidas a `www`: orden de A, TTL/caché | Pendiente |
 | D5 | Balanceador caído sigue anunciado por DNS | Pendiente |
-| B1 | Peticiones sucesivas a cada LB muestran ambas IPs privadas | Pendiente |
-| B2 | WordPress caído; ambos LB siguen atendiendo | Pendiente |
+| B1 | Peticiones sucesivas a cada LB muestran ambas IPs privadas | ✅ Realizada |
+| B2 | WordPress caído; ambos LB siguen atendiendo | ✅ Realizada |
 
 ### Verificación previa: registro en SSM a través del NAT
 Las tres instancias privadas (wp1, db y wp2) no tienen IP pública y aparecen **Online** en Systems Manager → Fleet Manager. El agente SSM se conecta por HTTPS (TCP 443) a endpoints públicos de AWS, y la única forma de llegar a ellos es la ruta `0.0.0.0/0 → ENI del NAT` de su subred. Esto confirma que el NAT de cada AZ funciona, incluido nat-b para wp2. Evidencia: `evidencias/fase2/ssm-managed-nodes.png`.
@@ -543,6 +563,68 @@ curl -v -m 5 http://3.128.168.127/
 
 **Interpretación.** El NAT de origen (masquerade) es asimétrico por diseño: permite que la subred privada **inicie** conexiones y deja pasar solo las respuestas, gracias al estado guardado en conntrack. Para que algo de Internet llegue a un servidor privado haría falta un DNAT explícito o, como en esta arquitectura, un intermediario que inicie la conexión: el balanceador HAProxy de la Fase 6. La protección es en capas: (1) el Security Group filtra en el borde de la ENI; (2) la ausencia de IP pública y de rutas hace que los privados no sean direccionables; (3) conntrack/NAT no tiene asociación para tráfico no solicitado; (4) la cadena `forward` con política `drop` bloquea cualquier reenvío no autorizado.
 
+### B1 — Distribución de solicitudes entre las dos instancias WordPress
+
+**Procedimiento.** Desde un cliente externo (WSL en el PC del equipo, sin cookies) se hacen 10 solicitudes sucesivas a cada balanceador por su EIP y se extrae del home la franja "servida por xyz-wpN · IPv4 privada …". Se repite por el nombre `www` (DNS Round Robin) y desde el navegador (F5). No hay caché: WordPress envía `Cache-Control: no-store` y la franja incluye la hora de generación.
+
+```bash
+for LB in 18.190.31.183 13.58.14.10; do
+  echo "== $LB =="
+  for i in $(seq 1 10); do
+    curl -s http://$LB/ | sed 's/<[^>]*>//g' | grep -o 'servida por.*IPv4 privada *[0-9.]*' | head -1
+  done
+done
+curl -sI http://18.190.31.183/ | grep -iE '^HTTP|x-served-by|x-balanced-by|cache-control'
+curl -sI http://13.58.14.10/   | grep -iE '^HTTP|x-served-by|x-balanced-by|cache-control'
+dig -4 +short www.xyzcosmetics.online
+```
+
+**Evidencia** (`evidencias/fase6/b1-curl-lb1-lb2.png`, `b1-curl-www-dns.png`, `b1-navegador-lb1.png`, `b1-navegador-lb2.png`):
+- Cada balanceador devolvió 10 respuestas alternando `xyz-wp1 · 10.0.11.10` y `xyz-wp2 · 10.0.12.10` (5 y 5).
+- `curl -I`: `200 OK`, `cache-control: no-store`, `x-served-by: xyz-wp… ` y `x-balanced-by: xyz-lb1` / `xyz-lb2` según el balanceador consultado.
+- `dig -4 +short www.xyzcosmetics.online` devuelve las dos EIP (18.190.31.183 y 13.58.14.10). Seis solicitudes a `www` dieron wp2, wp2, wp1, wp1, wp2, wp2: sin patrón estricto, porque el cliente elige una de las dos IP y cada balanceador lleva **su propio contador** de roundrobin.
+- Estadísticas de HAProxy justo antes de B2 (`evidencias/fase6/b2-stats-wp1-down-lb1.png`, `-lb2.png`, columna *Sessions → Total*): lb1 wp1 = 86 y wp2 = 86; lb2 wp1 = 66 y wp2 = 67. El reparto de las 172 y 133 solicitudes fue prácticamente exacto.
+
+**Interpretación.**
+1. Con un solo cliente, `roundrobin` alterna en cada solicitud porque cada una abre una conexión nueva y no hay afinidad (sin cookies ni hash de IP). Si hubiera varios clientes simultáneos, el orden se entremezclaría, pero el reparto total seguiría siendo parejo.
+2. Que ambas IPs aparezcan en el **home** (generado por PHP en cada petición con `SERVER_ADDR`) demuestra que la petición llegó realmente a cada nodo y no salió de una caché.
+3. `x-balanced-by` y `x-served-by` muestran los dos saltos: cliente → LB → WordPress.
+
+**Protocolos.** DNS (UDP 53) para resolver `www`; **TCP** (handshake SYN/SYN-ACK/ACK) cliente ↔ LB:80 y, como segunda conexión independiente, LB ↔ WP:80; **HTTP/1.1** `GET /` con respuesta `200` y cabeceras `Cache-Control`, `X-Served-By`, `X-Balanced-By`; HAProxy agrega `X-Forwarded-For` hacia el backend. El IGW traduce 1:1 la EIP del balanceador a su IP privada (10.0.1.20 / 10.0.2.20).
+
+### B2 — Una instancia WordPress deja de estar disponible
+
+**Procedimiento.** Con las páginas de estadísticas abiertas, se detuvo Apache en wp1 (`sudo systemctl stop apache2`, sesión SSM) y se repitió el bucle de B1 contra ambos balanceadores. Después se restauró (`sudo systemctl start apache2`) y se repitió.
+
+```bash
+# xyz-wp1
+sudo systemctl stop apache2        # corte
+sudo systemctl start apache2       # restauración
+# PC externo: bucle de B1 con marca de tiempo contra lb1 y lb2
+for i in $(seq 1 45); do
+  a=$(curl -s -m 3 http://18.190.31.183/ | sed 's/<[^>]*>//g' | grep -o 'xyz-wp[12] · IPv4 privada *[0-9.]*' | head -1)
+  b=$(curl -s -m 3 http://13.58.14.10/   | sed 's/<[^>]*>//g' | grep -o 'xyz-wp[12] · IPv4 privada *[0-9.]*' | head -1)
+  printf "%s lb1: %-34s lb2: %s\n" "$(date +%T)" "$a" "$b"; sleep 1
+done
+# lb1 / lb2: registro de HAProxy
+sudo journalctl --since "-4hours" --no-pager | grep -iE 'haproxy.*wp1'
+```
+
+**Evidencia** (`evidencias/fase6/b2-stats-wp1-down-lb1.png`, `b2-stats-wp1-down-lb2.png`, `b2-curl-con-wp1-caido.png`, `b2-journal-down-up.png`, `b2-stats-wp1-restaurado-lb1.png`, `-lb2.png`):
+- En las estadísticas de **ambos** balanceadores wp1 pasó a `DOWN` (rojo) con `LastChk = L4CON in 0ms` (la conexión TCP al puerto 80 fue rechazada, porque Apache estaba detenido) y wp2 siguió en `UP` (`L7OK/200`). El backend quedó en `1/1` servidores activos. El `DOWN` se registró hacia las 12:08.
+- Con wp1 caído, todas las respuestas de ambos balanceadores vinieron de `xyz-wp2 · 10.0.12.10`, sin errores para el cliente. *(⚠ COMPLETAR: pegar aquí el bucle con horas, el instante del `stop` y el de la primera línea sin wp1 = tiempo de detección.)*
+- *(⚠ COMPLETAR: pegar aquí las líneas del `journalctl`: "Server wordpress/wp1 is DOWN, reason: Layer4 connection problem" y el `UP` posterior, con sus horas.)*
+- Tras restaurar, wp1 volvió a `UP` y a recibir solicitudes. Los contadores lo reflejan: wp1 registra `Dwn = 1` y `Dwntme = 6m18s` (lb1) y `6m17s` (lb2) y los totales posteriores (lb1: wp1 96 / wp2 107; lb2: wp1 78 / wp2 82) muestran que wp2 absorbió más solicitudes durante el corte.
+
+**Interpretación.**
+1. **Detección.** HAProxy verifica cada 2 s (`inter 2s`); tras 2 fallos seguidos (`fall 2`) marca el servidor `DOWN`, así que tarda unos 4–6 s. Una petición que llegue justo antes de esa marca podría elegir wp1, pero `option redispatch` + `retries 3` la reintentan en wp2 y el cliente no ve el error.
+2. **Recuperación.** Con `rise 2`, wp1 vuelve a recibir tráfico tras 2 checks exitosos (unos 4 s), sin intervención.
+3. **Dos tipos de check.** `L4CON` significa que ni siquiera se completó el handshake TCP (puerto cerrado: el kernel responde RST). Si Apache respondiera pero WordPress/MariaDB fallaran, se vería `L7STS/5xx`. El check usa `GET /`, que ejecuta PHP y consulta la DB, por lo que detecta fallos de la aplicación y no solo del proceso.
+4. **Alta disponibilidad real.** Los dos balanceadores comparten el mismo backend: la caída de un WordPress se oculta a los clientes en ambos. A diferencia del DNS Round Robin (D5), HAProxy **retira automáticamente** el nodo fallido.
+5. **Límite.** Si cae `xyz-db` ambos WordPress fallan (ver §1.7): HAProxy balancea la capa web, no la de datos.
+
+**Protocolos.** TCP (el check intenta el handshake con wp1 y recibe RST) y HTTP/1.1 (`GET /` con `Host: www.xyzcosmetics.online`, respuesta esperada `200`).
+
 ## 4. Análisis de protocolos y capturas de tráfico
 _(Por documentar: IP, ICMP, TCP, DNS, HTTP, traducción NAT.)_
 
@@ -558,6 +640,7 @@ _(Por documentar: IP, ICMP, TCP, DNS, HTTP, traducción NAT.)_
 | P6 | ns2 registraba `refused notify from non-primary: 3.131.134.77` justo después de cada transferencia | Tras un AXFR, un secundario notifica a los NS de la zona, excepto al MNAME del SOA y a sus propias direcciones. ns2 solo conoce su IP privada, no su EIP (la traduce el IGW), así que se notificaba a sí mismo por la EIP y luego rechazaba el aviso por no venir de 10.0.1.10 | `notify no;` en la zona secundaria. En el primario, `notify explicit` + `also-notify` hacia la IP privada. Lección: con NAT 1:1 (EIP) la instancia desconoce su IP pública, así que la comunicación interna entre servidores debe usar IPs privadas |
 | P7 | `wp core download --locale=es_ES` fallaba con `The requested locale (es_ES) was not found` | Para la versión más reciente (7.1.5), la API de WordPress solo ofrecía el paquete completo en `en_US`, aunque el paquete de idioma `es_ES` sí existía | Descargar la versión base y luego `wp language core install es_ES --activate` en cada nodo (los `.mo` son locales; la opción `WPLANG` va en la DB). `DISALLOW_FILE_MODS` se limita al panel web para que WP-CLI pueda instalar el idioma |
 | P8 | La franja del home mostraba `IPv4 privada 127.0.0.1` | La prueba local se conectaba a 127.0.0.1, y `SERVER_ADDR` es la dirección local de esa conexión | Si `SERVER_ADDR` es loopback, el mu-plugin obtiene la IP de la interfaz de salida con un socket UDP conectado a 10.0.0.2. Lección: la IP "del servidor" depende de por cuál interfaz llegó la conexión |
+| P9 | `http://<EIP>:8404/stats` daba `ERR_CONNECTION_TIMED_OUT` aunque HAProxy escuchaba en `0.0.0.0:8404` y el puerto 80 respondía | El SG `xyz-sg-lb` solo permite el 8404 desde la IP pública del equipo (/32) y la regla no coincidía con la IP vigente (las IP públicas del equipo cambian). Un SG descarta sin responder, por eso se ve un timeout y no un `connection refused` | Se actualizó la regla con la IP actual. `curl -4 -m 5 -I http://<EIP>:8404/stats` debe responder `401 Unauthorized` (puerto abierto, falta autenticación). Lección: si cambia la red o la IP, hay que actualizar la regla; no se abrió el 8404 a 0.0.0.0/0 |
 
 ## 6. Referencias
 _(Formato IEEE; se agregan a medida que se usan.)_
