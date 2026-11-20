@@ -435,7 +435,7 @@ Para cada prueba: procedimiento, comandos, evidencia, interpretación y protocol
 | N1 | HTTP desde instancia privada a destino externo; IP pública observada | ✅ Realizada |
 | N2 | conntrack: asociaciones de direcciones/puertos antes y después del NAT | ✅ Realizada |
 | N3 | Deshabilitar IP forwarding y explicar la falla | ✅ Realizada |
-| N4 | Conexión saliente vs. entrante no solicitada | ✅ Realizada (falta adjuntar el tcpdump de nat-a) |
+| N4 | Conexión saliente vs. entrante no solicitada | ✅ Realizada |
 | D1 | dig SOA/NS/A/CNAME a ambos autoritativos; delegación pública | ✅ Realizada |
 | D2 | Cambio en primario + serial SOA → transferencia al secundario | ✅ Realizada |
 | D3 | Primario caído; secundario responde autoritativamente | ✅ Realizada |
@@ -804,4 +804,25 @@ Se realizaron capturas de paquetes con `tcpdump` en las interfaces `ens5` de los
 | P9 | `http://<EIP>:8404/stats` daba `ERR_CONNECTION_TIMED_OUT` aunque HAProxy escuchaba en `0.0.0.0:8404` y el puerto 80 respondía | El SG `xyz-sg-lb` solo permite el 8404 desde la IP pública del equipo (/32) y la regla no coincidía con la IP vigente (las IP públicas del equipo cambian). Un SG descarta sin responder, por eso se ve un timeout y no un `connection refused` | Se actualizó la regla con la IP actual. `curl -4 -m 5 -I http://<EIP>:8404/stats` debe responder `401 Unauthorized` (puerto abierto, falta autenticación). Lección: si cambia la red o la IP, hay que actualizar la regla; no se abrió el 8404 a 0.0.0.0/0 |
 
 ## 6. Referencias
-_(Formato IEEE; se agregan a medida que se usan.)_
+
+[1] J. Postel, "Internet Protocol," Internet Engineering Task Force (IETF), RFC 791, Sep. 1981. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc791
+
+[2] J. Postel, "Transmission Control Protocol," Internet Engineering Task Force (IETF), RFC 793, Sep. 1981. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc793
+
+[3] P. Mockapetris, "Domain Names - Implementation and Specification," Internet Engineering Task Force (IETF), RFC 1035, Nov. 1987. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc1035
+
+[4] Y. Rekhter, B. Moskowitz, D. Karrenberg, G. J. de Groot, y E. Lear, "Address Allocation for Private Internets," Internet Engineering Task Force (IETF), RFC 1918, Feb. 1996. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc1918
+
+[5] P. Vixie, "A Mechanism for Prompt Notification of Zone Changes (DNS NOTIFY)," Internet Engineering Task Force (IETF), RFC 1996, Ago. 1996. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc1996
+
+[6] P. Srisuresh y M. Holdrege, "IP Network Address Translator (NAT) Terminology and Considerations," Internet Engineering Task Force (IETF), RFC 2663, Ago. 1999. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc2663
+
+[7] R. Fielding y J. Reschke, "Hypertext Transfer Protocol (HTTP/1.1): Message Syntax and Routing," Internet Engineering Task Force (IETF), RFC 7230, Jun. 2014. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc7230
+
+[8] T. Haynes y D. Noveck, "Network File System (NFS) Version 4 Protocol," Internet Engineering Task Force (IETF), RFC 7530, Mar. 2015. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc7530
+
+[9] Amazon Web Services, "Amazon Virtual Private Cloud User Guide," AWS Documentation, 2026. [En línea]. Disponible: https://docs.aws.amazon.com/vpc/latest/userguide/
+
+[10] Internet Systems Consortium (ISC), "BIND 9 Administrator Reference Manual," ISC Documentation, 2026. [En línea]. Disponible: https://bind9.readthedocs.io/
+
+[11] W. Tarreau, "HAProxy Configuration Manual (Version 3.2)," HAProxy Technologies, 2026. [En línea]. Disponible: https://docs.haproxy.org/
