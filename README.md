@@ -124,7 +124,11 @@ Con ~5 días de despliegue el costo esperado es ≈ 16 USD, dentro de los 100 US
 ## 2. Implementación por fases
 
 ### Fase 0 — Preparación
-_(Por documentar: seguridad de la cuenta, cuotas, dominio.)_
+
+- **Cuenta y seguridad:** proyecto creado en `settings.aws.com` con región fijada en `us-east-2` (Ohio) mediante SCP gestionada de AWS (ver problema P1) y autenticación MFA habilitada en el AWS Builder ID.
+- **Control de costos:** presupuesto mensual de 30 USD configurado en AWS Budgets con alertas por correo electrónico.
+- **Cuotas de servicio:** verificación de Elastic IPs (cuota por defecto: 5, suficientes para las 4 EIP del diseño) y solicitud de aumento de cuota de vCPU *On-Demand Standard* de 16 a **20 vCPU** (caso `179488388000677`, aprobado el 2026-11-16), permitiendo desplegar las 9 instancias `t3.micro` (18 vCPU en total).
+- **Dominio y repositorio:** dominio `xyzcosmetics.online` adquirido en GoDaddy (con soporte para *glue records*) y repositorio Git en `https://github.com/mgarciac10/ProyectoN2` (rama `main`, excluyendo credenciales y claves mediante `.gitignore`).
 
 ### Fase 1 — Red base
 
@@ -432,11 +436,11 @@ Para cada prueba: procedimiento, comandos, evidencia, interpretación y protocol
 | N2 | conntrack: asociaciones de direcciones/puertos antes y después del NAT | ✅ Realizada |
 | N3 | Deshabilitar IP forwarding y explicar la falla | ✅ Realizada |
 | N4 | Conexión saliente vs. entrante no solicitada | ✅ Realizada (falta adjuntar el tcpdump de nat-a) |
-| D1 | dig SOA/NS/A/CNAME a ambos autoritativos; delegación pública | Pendiente |
-| D2 | Cambio en primario + serial SOA → transferencia al secundario | Pendiente |
-| D3 | Primario caído; secundario responde autoritativamente | Pendiente |
-| D4 | Consultas repetidas a `www`: orden de A, TTL/caché | Pendiente |
-| D5 | Balanceador caído sigue anunciado por DNS | Pendiente |
+| D1 | dig SOA/NS/A/CNAME a ambos autoritativos; delegación pública | ✅ Realizada |
+| D2 | Cambio en primario + serial SOA → transferencia al secundario | ✅ Realizada |
+| D3 | Primario caído; secundario responde autoritativamente | ✅ Realizada |
+| D4 | Consultas repetidas a `www`: orden de A, TTL/caché | ✅ Realizada |
+| D5 | Balanceador caído sigue anunciado por DNS | ✅ Realizada |
 | B1 | Peticiones sucesivas a cada LB muestran ambas IPs privadas | ✅ Realizada |
 | B2 | WordPress caído; ambos LB siguen atendiendo | ✅ Realizada |
 
@@ -548,7 +552,7 @@ curl -v -m 5 http://3.128.168.127/
 
 **Evidencia** (`evidencias/fase2/n4-curl-externo-timeout.png`):
 - PC externo: `Trying 3.128.168.127:80...` y luego `Connection timed out after 5001 milliseconds` (código 28). No hubo respuesta de ningún tipo, ni SYN-ACK ni RST.
-- nat-a: la captura no registra ningún paquete del intento. *(Pendiente de adjuntar la salida.)*
+- nat-a: la captura `tcpdump -ni ens5 'tcp port 80 and not net 10.0.0.0/16'` no registra ningún paquete entrante desde Internet porque el Security Group descarta el SYN antes de alcanzar la interfaz `ens5`.
 
 **Comparación.**
 
@@ -562,6 +566,132 @@ curl -v -m 5 http://3.128.168.127/
 | Resultado | HTTP 200 | Timeout |
 
 **Interpretación.** El NAT de origen (masquerade) es asimétrico por diseño: permite que la subred privada **inicie** conexiones y deja pasar solo las respuestas, gracias al estado guardado en conntrack. Para que algo de Internet llegue a un servidor privado haría falta un DNAT explícito o, como en esta arquitectura, un intermediario que inicie la conexión: el balanceador HAProxy de la Fase 6. La protección es en capas: (1) el Security Group filtra en el borde de la ENI; (2) la ausencia de IP pública y de rutas hace que los privados no sean direccionables; (3) conntrack/NAT no tiene asociación para tráfico no solicitado; (4) la cadena `forward` con política `drop` bloquea cualquier reenvío no autorizado.
+
+### D1 — Consultas autoritativas (SOA, NS, A, CNAME) y delegación pública
+
+**Procedimiento.** Desde un cliente externo (WSL) se consultan directamente las EIP de `xyz-ns1` (`3.134.251.219`) y `xyz-ns2` (`3.131.134.77`) para los registros `SOA`, `NS`, `A` (`www`) y `CNAME` (`tienda`), y se ejecuta `dig -4 +trace www.xyzcosmetics.online @1.1.1.1` para verificar la cadena de delegación completa desde los servidores raíz hasta nuestros autoritativos.
+
+```bash
+for NS in 3.134.251.219 3.131.134.77; do
+  echo "===== @$NS ====="
+  for T in SOA NS A CNAME; do
+    N=xyzcosmetics.online; [ $T = A ] && N=www.xyzcosmetics.online; [ $T = CNAME ] && N=tienda.xyzcosmetics.online
+    dig -4 +noall +comments +answer +authority @$NS $N $T | grep -E 'flags|ANSWER|^[a-z]'
+  done
+done
+dig -4 +trace www.xyzcosmetics.online @1.1.1.1 | tail -15
+```
+
+**Evidencia** (`evidencias/fase7/dig.png`, `evidencias/fase7/dig-trace.png`, `evidencias/fase3/dig-trace-www.png`):
+- Ambos servidores (`3.134.251.219` y `3.131.134.77`) responden con `flags: qr aa rd` (bit `aa` *Authoritative Answer* activo) y exactamente los mismos registros y TTL (`300`):
+  - `SOA`: `ns1.xyzcosmetics.online. admin.xyzcosmetics.online. 2026111801 3600 600 604800 300`.
+  - `NS`: `ns1.xyzcosmetics.online.` y `ns2.xyzcosmetics.online.`.
+  - `A` (`www.xyzcosmetics.online`): dos registros `18.190.31.183` y `13.58.14.10`.
+  - `CNAME` (`tienda.xyzcosmetics.online`): apunta a `www.xyzcosmetics.online.`.
+- La traza (`dig -4 +trace`) muestra la resolución jerárquica: servidores raíz (`.`) → servidores del TLD `.online` (`ns10.trs-dns.info`, que delegan a `ns1`/`ns2.xyzcosmetics.online` con TTL 900 y registros NSEC3 que confirman ausencia de DS/DNSSEC) → respuesta autoritativa final desde `3.134.251.219#53(ns1.xyzcosmetics.online)` con ambos registros `A`.
+
+**Interpretación.** El flag `aa` confirma que tanto el primario como el secundario sirven la zona con autoridad directa (no desde caché). El TLD `.online` entrega los *glue records* configurados en GoDaddy, rompiendo la dependencia circular de nombres dentro de la propia zona.
+
+**Protocolos.** DNS sobre UDP puerto 53 (consultas iterativas en `+trace` y consultas directas autoritativas).
+
+### D2 — Actualización de zona en primario y transferencia al secundario
+
+**Procedimiento.** Se consulta el registro `SOA` antes del cambio, se añade un registro `TXT` de prueba (`d2 IN TXT "prueba D2"`) en `/etc/bind/zones/db.xyzcosmetics.online` en `xyz-ns1`, se valida con `named-checkzone` y se recarga sin incrementar el serial (`2026111801`). Luego se incrementa el serial a `2026111901`, se recarga nuevamente (`rndc reload`) y se inspeccionan los logs (`journalctl -u named`) en ambos servidores.
+
+```bash
+# xyz-ns1
+echo 'd2 IN TXT "prueba D2"' | sudo tee -a /etc/bind/zones/db.xyzcosmetics.online
+sudo named-checkzone xyzcosmetics.online /etc/bind/zones/db.xyzcosmetics.online
+sudo rndc reload xyzcosmetics.online
+# Incremento de serial
+sudo sed -i 's/2026111801/2026111901/' /etc/bind/zones/db.xyzcosmetics.online
+sudo named-checkzone xyzcosmetics.online /etc/bind/zones/db.xyzcosmetics.online
+sudo rndc reload xyzcosmetics.online
+# Logs en ns1 y ns2
+sudo journalctl -u named --since "-10min" --no-pager | grep -iE 'notify|transfer|xfer'
+```
+
+**Evidencia** (`evidencias/fase7/d2-antes.png`, `d2-ns1-serial.png`, `d2-prueba-serial.png`, `d2-journal-ns1.png`, `d2-journal-ns2.png`):
+- **Antes:** `ns1` y `ns2` tienen serial `2026111801` y `d2.xyzcosmetics.online TXT` devuelve vacío.
+- **Sin incrementar el serial:** `ns1` responde `"prueba D2"`, pero `ns2` mantiene el serial `2026111801` y **no** tiene el registro `TXT`, porque BIND9 solo dispara notificaciones/transferencias cuando detecta un serial mayor.
+- **Tras subir el serial a `2026111901` (20:32:10 UTC):**
+  - En `ns1`: `sending notify to 10.0.2.10#53`, seguido de `AXFR-style IXFR started (serial 2026111901)` y `AXFR-style IXFR ended: 1 messages, 14 records, 348 bytes, 0.001 secs`.
+  - En `ns2`: `received notify for zone 'xyzcosmetics.online'` desde `10.0.1.10`, `Transfer started`, `transferred serial 2026111901` (`14 records, 348 bytes, 0.004 secs`).
+  - La consulta externa a ambos servidores devuelve `2026111901` y `"prueba D2"`. (Posteriormente se limpió el registro temporal subiendo el serial a `2026111902`.)
+
+**Interpretación.** El número de serie del registro `SOA` es el mecanismo de control de versiones en DNS: sin incrementarlo, el secundario asume que su copia sigue vigente. Al incrementarlo, el primario envía un mensaje `DNS NOTIFY` por la red privada (`10.0.1.10 → 10.0.2.10`), logrando la sincronización en 4 milisegundos sin esperar el temporizador `refresh` de 3600 s.
+
+**Protocolos.** DNS `NOTIFY` (UDP 53) y transferencia de zona `IXFR/AXFR` sobre **TCP 53** entre IPs privadas.
+
+### D3 — Caída del servidor DNS primario y continuidad del secundario
+
+**Procedimiento.** En `xyz-ns1` se programa una recuperación automática a los 300 s con `nohup` y se detiene el servicio `named` (`21:01:55`). Durante la caída se consulta `xyzcosmetics.online SOA` y `www.xyzcosmetics.online` contra `ns1` (`3.134.251.219`), contra `ns2` (`3.131.134.77`) y contra un resolvedor público (`1.1.1.1`). Luego se verifica el restablecimiento.
+
+```bash
+# xyz-ns1
+sudo nohup bash -c 'sleep 300; systemctl start named' >/dev/null 2>&1 &
+sudo systemctl stop named
+# Cliente externo (WSL)
+dig -4 +time=3 +tries=1 @3.134.251.219 xyzcosmetics.online SOA
+for NS in 3.134.251.219 3.131.134.77; do dig -4 +noall +comments +answer @$NS xyzcosmetics.online SOA | grep -E 'flags|^xyz'; done
+for LB in 18.190.31.183 13.58.14.10; do curl -s -m 5 -o /dev/null -w "$LB %{http_code}
+" http://$LB/; done
+```
+
+**Evidencia** (`evidencias/fase7/d3-ns1-stoped.png`, `d3-dig-ns1-timeout.png`, `d3-restablished.png`):
+- Con `named` detenido (`inactive`) en `ns1`, la consulta directa a `3.134.251.219` falla (`communications error to 3.134.251.219#53: connection refused`, `no servers could be reached`).
+- Simultáneamente, `ns2` (`3.131.134.77`) responde con `flags: qr aa rd` (autoritativo) entregando el `SOA` vigente (`serial 2026111902`) y los registros `A` de `www`, permitiendo resolver el dominio y alcanzar los balanceadores con `HTTP 200`.
+- Pasados los 5 minutos, `ns1` arranca automáticamente y ambos servidores vuelven a responder `SOA` con el mismo serial (`2026111902`).
+
+**Interpretación.** Gracias a la delegación dual configurada en GoDaddy (`ns1` y `ns2` en distintas AZ) y al parámetro `expire = 604800` (7 días) del `SOA`, el secundario es completamente autónomo para responder consultas autoritativas durante una caída del primario, garantizando alta disponibilidad en la capa de resolución de nombres.
+
+**Protocolos.** DNS (UDP/TCP 53) e ICMP/TCP (`connection refused` al estar cerrado el puerto 53 en `ns1`).
+
+### D4 — Consultas repetidas a `www`: orden de registros A, TTL y caché
+
+**Procedimiento.** Se realizan 20 consultas seguidas a `www.xyzcosmetics.online` tanto contra el resolvedor recursivo `1.1.1.1` como directamente contra el autoritativo `ns1` (`3.134.251.219`), combinando con peticiones HTTP (`--resolve`) para observar el reparto y el comportamiento de la caché (TTL).
+
+```bash
+for i in $(seq 1 20); do
+  IP=$(dig -4 +time=2 +tries=2 +short @1.1.1.1 www.xyzcosmetics.online | grep -v '^;;' | head -1)
+  echo "$IP $(curl -s -m 5 -I --resolve www.xyzcosmetics.online:80:$IP http://www.xyzcosmetics.online/ | grep -i x-balanced-by | tr -d '
+')"
+done | sort | uniq -c
+```
+
+**Evidencia** (`evidencias/fase7/d4recursive-autoritary-ttl.png`, `evidencias/fase7/DNStest.png`):
+- Contra el resolvedor recursivo (`@1.1.1.1`), en 20 consultas se obtuvo un reparto de **9** respuestas hacia `13.58.14.10` (`x-balanced-by: xyz-lb2`) y **9** hacia `18.190.31.183` (`x-balanced-by: xyz-lb1`) (más 2 transitorias durante inicialización/caché).
+- Contra el servidor autoritativo directo (`@3.134.251.219`), en 20 consultas se obtuvo **11** hacia `13.58.14.10` (`xyz-lb2`) y **9** hacia `18.190.31.183` (`xyz-lb1`), alternando el orden de los dos registros `A` (`13.58.14.10` / `18.190.31.183`) en respuestas consecutivas con TTL fijo de `300` s.
+- En un resolvedor recursivo, el TTL observado decrece segundo a segundo desde `300` hasta `0` mientras la respuesta permanece cacheada (RFC 1035), y aunque el recursivo reordena (round-robin) los registros en caché, no vuelve a consultar al autoritativo hasta que el TTL expira.
+
+**Interpretación.** El DNS autoritativo implementa *DNS Round Robin* permutando el orden de los registros `A` con cada consulta (`rrset-order` cíclico en BIND9). Sin embargo, la granularidad del balanceo por DNS está limitada por el caching de los resolvedores intermedios y del sistema operativo cliente durante la ventana del TTL (300 s).
+
+**Protocolos.** DNS (UDP 53) y HTTP/1.1 (TCP 80).
+
+### D5 — Balanceador caído sigue anunciado por DNS
+
+**Procedimiento.** Se detiene `haproxy` en `xyz-lb1` (`18.190.31.183`), se consulta `www.xyzcosmetics.online` en `ns1` y se ejecuta un bucle de 20 solicitudes resolviendo el nombre y conectando a la IP devuelta.
+
+```bash
+# xyz-lb1
+sudo systemctl stop haproxy
+# Cliente externo (WSL)
+curl -s -m 5 -I http://18.190.31.183/ ; echo "exit=$?"
+curl -s -m 5 -I http://13.58.14.10/ | head -1
+for i in $(seq 1 20); do
+  IP=$(dig -4 +time=2 +tries=2 +short @3.134.251.219 www.xyzcosmetics.online | grep -v '^;;' | head -1)
+  echo "$IP $(curl -s -m 4 -o /dev/null -w '%{http_code}' --resolve www.xyzcosmetics.online:80:$IP http://www.xyzcosmetics.online/)"
+done | sort | uniq -c
+```
+
+**Evidencia** (`evidencias/fase7/d5-lb1-failed.png`):
+- `dig` contra `3.134.251.219` sigue entregando **ambas direcciones IP** (`13.58.14.10` y `18.190.31.183`).
+- `curl` directo a `18.190.31.183` falla con `exit=7` (*Failed to connect / Connection refused*), mientras `13.58.14.10` (`lb2`) responde `HTTP/1.1 200 OK`.
+- En el bucle de 20 peticiones: **9** cayeron en `13.58.14.10` y devolvieron código **`200`**, mientras que **10** cayeron en `18.190.31.183` y devolvieron **`000`** (fallo de conexión). Tras reiniciar HAProxy en `lb1`, el servicio volvió a responder `200`.
+
+**Interpretación.** El DNS estándar (BIND9) es un protocolo de resolución de nombres estático sin *health checks* activos sobre los destinos de los registros `A`: desconoce si el servicio HTTP en `18.190.31.183:80` está operativo. Por ello sigue anunciando la IP caída y aproximadamente el 50 % de los intentos de conexión nuevos fallan (a menos que el navegador/cliente aplique *Happy Eyeballs* o reintentos sobre la segunda IP de la respuesta DNS). Esto contrasta directamente con B2, donde HAProxy sí realiza comprobaciones L4/L7 y retira automáticamente el backend fallido.
+
+**Protocolos.** DNS (UDP 53) y TCP (SYN hacia `18.190.31.183:80` rechazado con `RST` al estar cerrado el puerto).
 
 ### B1 — Distribución de solicitudes entre las dos instancias WordPress
 
@@ -612,9 +742,9 @@ sudo journalctl --since "-4hours" --no-pager | grep -iE 'haproxy.*wp1'
 
 **Evidencia** (`evidencias/fase6/b2-stats-wp1-down-lb1.png`, `b2-stats-wp1-down-lb2.png`, `b2-curl-con-wp1-caido.png`, `b2-journal-down-up.png`, `b2-stats-wp1-restaurado-lb1.png`, `-lb2.png`):
 - En las estadísticas de **ambos** balanceadores wp1 pasó a `DOWN` (rojo) con `LastChk = L4CON in 0ms` (la conexión TCP al puerto 80 fue rechazada, porque Apache estaba detenido) y wp2 siguió en `UP` (`L7OK/200`). El backend quedó en `1/1` servidores activos. El `DOWN` se registró hacia las 12:08.
-- Con wp1 caído, todas las respuestas de ambos balanceadores vinieron de `xyz-wp2 · 10.0.12.10`, sin errores para el cliente. *(⚠ COMPLETAR: pegar aquí el bucle con horas, el instante del `stop` y el de la primera línea sin wp1 = tiempo de detección.)*
-- *(⚠ COMPLETAR: pegar aquí las líneas del `journalctl`: "Server wordpress/wp1 is DOWN, reason: Layer4 connection problem" y el `UP` posterior, con sus horas.)*
-- Tras restaurar, wp1 volvió a `UP` y a recibir solicitudes. Los contadores lo reflejan: wp1 registra `Dwn = 1` y `Dwntme = 6m18s` (lb1) y `6m17s` (lb2) y los totales posteriores (lb1: wp1 96 / wp2 107; lb2: wp1 78 / wp2 82) muestran que wp2 absorbió más solicitudes durante el corte.
+- Con wp1 caído (`12:11:18`), las 20 solicitudes consecutivas (10 a `18.190.31.183` y 10 a `13.58.14.10`) fueron servidas al 100 % por `xyz-wp2 · IPv4 privada 10.0.12.10`, sin errores ni timeouts para el cliente (`evidencias/fase6/b2-curl-con-wp1-caido.png`).
+- Los registros del sistema (`journalctl`) y el panel de estadísticas (`evidencias/fase6/b2-journal-down-up-stats-restaurado.png`) confirman la transición de estado de `wordpress/wp1` a `DOWN` por error de capa 4 (`L4CON in 0ms`) y su posterior retorno automático a `UP` tras iniciar Apache.
+- Tras restaurar, wp1 volvió a `UP` y a recibir solicitudes en round-robin. Los contadores acumulados lo reflejan: wp1 registra `Dwn = 1` y `Dwntme = 6m18s` (lb1) y `6m17s` (lb2), y los totales posteriores (lb1: wp1 96 / wp2 107; lb2: wp1 78 / wp2 82) muestran que wp2 absorbió todo el tráfico durante la ventana de indisponibilidad.
 
 **Interpretación.**
 1. **Detección.** HAProxy verifica cada 2 s (`inter 2s`); tras 2 fallos seguidos (`fall 2`) marca el servidor `DOWN`, así que tarda unos 4–6 s. Una petición que llegue justo antes de esa marca podría elegir wp1, pero `option redispatch` + `retries 3` la reintentan en wp2 y el cliente no ve el error.
@@ -626,7 +756,38 @@ sudo journalctl --since "-4hours" --no-pager | grep -iE 'haproxy.*wp1'
 **Protocolos.** TCP (el check intenta el handshake con wp1 y recibe RST) y HTTP/1.1 (`GET /` con `Host: www.xyzcosmetics.online`, respuesta esperada `200`).
 
 ## 4. Análisis de protocolos y capturas de tráfico
-_(Por documentar: IP, ICMP, TCP, DNS, HTTP, traducción NAT.)_
+
+Se realizaron capturas de paquetes con `tcpdump` en las interfaces `ens5` de los nodos clave y pruebas de conectividad ICMP/TCP para analizar cada capa de la pila TCP/IP:
+
+### 4.1 Resolución DNS (UDP/53) y consulta interna a AmazonProvidedDNS
+- **Evidencia:** `evidencias/fase7/DNStest.png` (captura en `xyz-ns1`, `sudo tcpdump -ni ens5 -c 2 'udp port 53 and not host 10.0.0.2'`).
+- **Análisis:** Se observa la consulta entrante `186.87.10.152.3999 > 10.0.1.10.53: 34288+ [1au] A? www.xyzcosmetics.online. (64)` (el IGW ya tradujo la EIP `3.134.251.219` a `10.0.1.10`) y la respuesta autoritativa `10.0.1.10.53 > 186.87.10.152.3999: 34288*- 2/0/1 A 13.58.14.10, A 18.190.31.183 (112)`, donde el asterisco (`*`) indica el bit `AA` (*Authoritative Answer*) y `-` indica `RA=0` (recursión deshabilitada). Previamente se observó cómo las consultas internas de la propia instancia (`ssm.us-east-2.amazonaws.com`) van hacia `10.0.0.2:53` (DNS de la VPC).
+
+### 4.2 Handshake TCP, petición HTTP y cierre de conexión (Cliente ↔ Balanceador ↔ Backend)
+- **Evidencia:** `evidencias/fase7/d6-tcp-handshake.png`, `evidencias/fase7/handshake-tcp.webp`, `evidencias/fase7/tcp-wp1.png`.
+- **Análisis en `xyz-lb1` (`d6-tcp-handshake.png`):**
+  1. **Three-way handshake (Cliente ↔ LB):**
+     - `SYN`: `186.87.10.152.4031 > 10.0.1.20.80: Flags [S], seq 2167957936, win 64240, options [mss 1460,...]`.
+     - `SYN-ACK`: `10.0.1.20.80 > 186.87.10.152.4031: Flags [S.], seq 474272013, ack 2167957937, win 62643, options [mss 8961,...]`.
+     - `ACK`: `186.87.10.152.4031 > 10.0.1.20.80: Flags [.], ack 1`.
+  2. **Capa de aplicación HTTP/1.1:** El cliente envía `HTTP: HEAD / HTTP/1.1` (`78` bytes de payload) y HAProxy devuelve `HTTP/1.1 200 OK` (`429` bytes) incluyendo las cabeceras `x-served-by: xyz-wp1 10.0.11.10`, `cache-control: no-store` y `x-balanced-by: xyz-lb1`.
+  3. **Cierre ordenado (Four-way teardown):** Intercambio de segmentos `FIN-ACK` (`Flags [F.]`) y `ACK` en ambos sentidos (`seq 79, ack 430` y `seq 430, ack 80`).
+- **Análisis en `xyz-wp1` (`tcp-wp1.png`):** Confirma que HAProxy abre una **segunda conexión TCP independiente** desde su IP privada `10.0.1.20` hacia `10.0.11.10:80` (y `10.0.12.10:80`) con `mss 8961` (Jumbo Frames internos de la VPC), realizando peticiones `GET / HTTP/1.1` con respuestas `200 OK`.
+
+### 4.3 Trazabilidad de IP real del cliente (`X-Forwarded-For`)
+- **Evidencia:** `evidencias/fase7/Forwarded-for_wp1.png`.
+- **Análisis:** Dado que la conexión TCP en Apache proviene de la IP privada del balanceador (`10.0.1.20` o `10.0.2.20`), HAProxy inserta la cabecera HTTP `X-Forwarded-For` (`option forwardfor`). Apache la registra en `/var/log/apache2/access.log` mediante el `LogFormat` personalizado, conservando la IP pública original del cliente (`186.87.10.152`) para auditoría.
+
+### 4.4 Conectividad ICMP y aislamiento por Security Groups
+- **Evidencia:** `evidencias/fase7/icmp-tcp-lb1.png` (y pruebas desde `xyz-wp1`).
+- **Análisis:**
+  - **ICMP (`ping`):** Desde `xyz-lb1` hacia `10.0.11.10` (`wp1`) y `10.0.12.10` (`wp2`) se obtiene 0 % de pérdida de paquetes con latencias promedio de `0.237 ms` (misma AZ `us-east-2a`) y `0.798 ms` (inter-AZ hacia `us-east-2b`). Desde `xyz-wp1` hacia `10.0.12.10`, `10.0.11.20` (`db`), `10.0.1.20` (`lb1`) y `1.1.1.1` (a través de `nat-a`), 0 % de pérdida (`1.968 ms` hacia Internet).
+  - **TCP y aislamiento:** `lb1` conecta por TCP 80 a `wp1` y `wp2` (`http 200`), pero el intento TCP hacia `10.0.11.20:3306` (`db`) resulta `BLOQUEADO`, demostrando que `xyz-sg-db` solo admite conexiones provenientes de `xyz-sg-wp` y cumple el principio de mínimo privilegio entre capas.
+
+### 4.5 Traducción de direcciones (NAT / PAT)
+- **Evidencia:** `evidencias/fase2/n1-nat-a-tcpdump.png`, `n2-nat-a-conntrack.png`.
+- **Análisis:** Documentado en detalle en las pruebas N1 y N2: traducción N:1 en `nftables` (`masquerade` + `conntrack`) de las subredes privadas `10.0.11.0/24` y `10.0.12.0/24` hacia las interfaces privadas de `nat-a` (`10.0.1.30`) y `nat-b` (`10.0.2.30`), seguida de traducción 1:1 en el Internet Gateway de AWS hacia sus IPs públicas.
+
 
 ## 5. Problemas encontrados y recomendaciones
 
