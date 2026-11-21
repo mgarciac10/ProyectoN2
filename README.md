@@ -6,7 +6,7 @@
 |---|---|
 | Curso | SI3002 — Telemática |
 | Integrantes | Mateo García Carreño · Victor Infante |
-| Docente | juan Carlos Montoya |
+| Docente | Juan Carlos Montoya |
 | Institución | Universidad EAFIT |
 | Fecha | 20 de noviembre de 2026 |
 | Dominio | `xyzcosmetics.online` |
@@ -158,9 +158,9 @@ Las figuras son las capturas de la carpeta `evidencias/`, numeradas en el orden 
 - Figura 65. B2 — Una instancia WordPress deja de estar disponible — `evidencias/fase6/b2-journal-down-up-stats-restaurado.png`
 - Figura 66. 4.2 Handshake TCP, petición HTTP y cierre de conexión (Cliente ↔ Balanceador ↔ Backend) — `evidencias/fase7/d6-tcp-handshake.png`
 - Figura 67. 4.2 Handshake TCP, petición HTTP y cierre de conexión (Cliente ↔ Balanceador ↔ Backend) — `evidencias/fase7/handshake-tcp.webp`
-- Figura 68. 4.2 Handshake TCP, petición HTTP y cierre de conexión (Cliente ↔ Balanceador ↔ Backend) — `evidencias/fase7/tcp-wp1.png`
-- Figura 69. 4.3 Trazabilidad de IP real del cliente (X-Forwarded-For) — `evidencias/fase7/Forwarded-for_wp1.png`
-- Figura 70. 4.4 Conectividad ICMP y aislamiento por Security Groups — `evidencias/fase7/icmp-tcp-lb1.png`
+- Figura 68. 4.3 Trazabilidad de IP real del cliente (X-Forwarded-For) — `evidencias/fase7/Forwarded-for_wp1.png`
+- Figura 69. 4.4 Conectividad ICMP y aislamiento por Security Groups — `evidencias/fase7/icmp-tcp-lb1.png`
+- Figura 70. 4.4 Conectividad ICMP y aislamiento por Security Groups — `evidencias/fase7/tcp-wp1.png`
 
 ---
 
@@ -981,7 +981,7 @@ Se realizaron capturas de paquetes con `tcpdump` en las interfaces `ens5` de los
 - **Análisis:** Se observa la consulta entrante `186.87.10.152.3999 > 10.0.1.10.53: 34288+ [1au] A? www.xyzcosmetics.online. (64)` (el IGW ya tradujo la EIP `3.134.251.219` a `10.0.1.10`) y la respuesta autoritativa `10.0.1.10.53 > 186.87.10.152.3999: 34288*- 2/0/1 A 13.58.14.10, A 18.190.31.183 (112)`, donde el asterisco (`*`) indica el bit `AA` (*Authoritative Answer*) y `-` indica `RA=0` (recursión deshabilitada). Previamente se observó cómo las consultas internas de la propia instancia (`ssm.us-east-2.amazonaws.com`) van hacia `10.0.0.2:53` (DNS de la VPC).
 
 ### 4.2 Handshake TCP, petición HTTP y cierre de conexión (Cliente ↔ Balanceador ↔ Backend)
-- **Evidencia:** `evidencias/fase7/d6-tcp-handshake.png`, `evidencias/fase7/handshake-tcp.webp`, `evidencias/fase7/tcp-wp1.png`.
+- **Evidencia:** `evidencias/fase7/d6-tcp-handshake.png`, `evidencias/fase7/handshake-tcp.webp` (la misma captura en `xyz-lb1`, junto a la respuesta `curl -sI` del cliente).
 - **Análisis en `xyz-lb1` (`d6-tcp-handshake.png`):**
   1. **Three-way handshake (Cliente ↔ LB)** [18]**:**
      - `SYN`: `186.87.10.152.4031 > 10.0.1.20.80: Flags [S], seq 2167957936, win 64240, options [mss 1460,...]`.
@@ -989,17 +989,19 @@ Se realizaron capturas de paquetes con `tcpdump` en las interfaces `ens5` de los
      - `ACK`: `186.87.10.152.4031 > 10.0.1.20.80: Flags [.], ack 1`.
   2. **Capa de aplicación HTTP/1.1** [19], [20]**:** El cliente envía `HTTP: HEAD / HTTP/1.1` (`78` bytes de payload) y HAProxy devuelve `HTTP/1.1 200 OK` (`429` bytes) incluyendo las cabeceras `x-served-by: xyz-wp1 10.0.11.10`, `cache-control: no-store` y `x-balanced-by: xyz-lb1`.
   3. **Cierre ordenado (Four-way teardown):** Intercambio de segmentos `FIN-ACK` (`Flags [F.]`) y `ACK` en ambos sentidos (`seq 79, ack 430` y `seq 430, ack 80`).
-- **Análisis en `xyz-wp1` (`tcp-wp1.png`):** Confirma que HAProxy abre una **segunda conexión TCP independiente** desde su IP privada `10.0.1.20` hacia `10.0.11.10:80` (y `10.0.12.10:80`) con `mss 8961` (Jumbo Frames internos de la VPC), realizando peticiones `GET / HTTP/1.1` con respuestas `200 OK`.
+- **MSS asimétrico:** el cliente anuncia `mss 1460` (MTU 1500 de Internet) y `lb1` anuncia `mss 8961`, porque su interfaz en la VPC usa *jumbo frames* (MTU 9001 − 40 bytes de cabeceras IP y TCP). Cada extremo envía segmentos que no superen el MSS anunciado por el otro, así que hacia el cliente se usan segmentos de hasta 1460 bytes.
+- **Segunda conexión (LB ↔ WordPress):** HAProxy es un proxy inverso, así que para atender la petición abre otra conexión TCP independiente, desde `10.0.1.20` hacia `10.0.11.10:80` o `10.0.12.10:80`, con su propio handshake. Lo confirman la cabecera `x-served-by` de la respuesta y la IP de origen que registra Apache (sección 4.3). En el repositorio no hay una captura `tcpdump` de ese segundo tramo en wp1.
 
 ### 4.3 Trazabilidad de IP real del cliente (`X-Forwarded-For`)
 - **Evidencia:** `evidencias/fase7/Forwarded-for_wp1.png`.
 - **Análisis:** Dado que la conexión TCP en Apache proviene de la IP privada del balanceador (`10.0.1.20` o `10.0.2.20`), HAProxy inserta la cabecera HTTP `X-Forwarded-For` (`option forwardfor`). Apache la registra en `/var/log/apache2/xyz-access.log` mediante el `LogFormat` personalizado `xyz` del VirtualHost (`%h %{X-Forwarded-For}i …`, Fase 5), conservando la IP pública original del cliente (`186.87.10.152`) para auditoría.
 
 ### 4.4 Conectividad ICMP y aislamiento por Security Groups
-- **Evidencia:** `evidencias/fase7/icmp-tcp-lb1.png` (y pruebas desde `xyz-wp1`).
+- **Evidencia:** `evidencias/fase7/icmp-tcp-lb1.png` (desde `xyz-lb1`) y `evidencias/fase7/tcp-wp1.png` (desde `xyz-wp1`).
 - **Análisis:**
   - **ICMP (`ping`)** [21]**:** Desde `xyz-lb1` hacia `10.0.11.10` (`wp1`) y `10.0.12.10` (`wp2`) se obtiene 0 % de pérdida de paquetes con latencias promedio de `0.237 ms` (misma AZ `us-east-2a`) y `0.798 ms` (inter-AZ hacia `us-east-2b`). Desde `xyz-wp1` hacia `10.0.12.10`, `10.0.11.20` (`db`), `10.0.1.20` (`lb1`) y `1.1.1.1` (a través de `nat-a`), 0 % de pérdida (`1.968 ms` hacia Internet).
   - **TCP y aislamiento:** `lb1` conecta por TCP 80 a `wp1` y `wp2` (`http 200`), pero el intento TCP hacia `10.0.11.20:3306` (`db`) resulta `BLOQUEADO`, demostrando que `xyz-sg-db` solo admite conexiones provenientes de `xyz-sg-wp` y cumple el principio de mínimo privilegio entre capas.
+  - **Desde `xyz-wp1`** (`/dev/tcp` de bash): `10.0.11.20:3306` y `10.0.11.20:2049` → `ABIERTO` (wp1 tiene `xyz-sg-wp`), pero `10.0.12.10:80` (wp2) → `BLOQUEADO`, porque `xyz-sg-wp` solo acepta el puerto 80 desde `xyz-sg-lb`. Los dos WordPress no se pueden conectar entre sí por HTTP. El ping entre ellos sí funciona, porque el ICMP está permitido desde 10.0.0.0/16. En la captura, el primer intento muestra todo `BLOQUEADO` por un error de sintaxis en el comando (`${t#*:})` con un paréntesis de más). El segundo intento, ya corregido, es el válido.
 
 ### 4.5 Traducción de direcciones (NAT / PAT)
 - **Evidencia:** `evidencias/fase2/n1-nat-a-tcpdump.png`, `n2-nat-a-conntrack.png`.
