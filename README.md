@@ -1,8 +1,176 @@
-# Proyecto N2 — Despliegue de Aplicaciones y Servicios en Red (SI3002)
+# Proyecto N2 — Despliegue de Aplicaciones y Servicios en Red
 
-Despliegue del sitio web corporativo de **XYZ S.A.** (cosméticos) en **WordPress** sobre una infraestructura en **AWS** con alta disponibilidad y escalado horizontal: VPC en dos zonas de disponibilidad, **NAT propio** sobre Linux, **balanceadores HAProxy** autogestionados, **DNS autoritativo BIND9** primario/secundario y una base de datos **MariaDB** compartida.
+**Despliegue en AWS del sitio web de XYZ S.A. sobre una infraestructura de red propia**
 
-> Este documento recoge el diseño, la implementación y las pruebas. Es la base del informe final.
+| | |
+|---|---|
+| Curso | SI3002 — Telemática |
+| Integrantes | Mateo García Carreño · Victor Infante |
+| Docente | juan Carlos Montoya |
+| Institución | Universidad EAFIT |
+| Fecha | 20 de noviembre de 2026 |
+| Dominio | `xyzcosmetics.online` |
+| Repositorio | https://github.com/mgarciac10/ProyectoN2 |
+
+---
+
+## Tabla de contenido
+
+- [Introducción](#introducción)
+- [1. Arquitectura](#1-arquitectura)
+  - [1.1 Diagrama general](#11-diagrama-general)
+  - [1.2 Flujo de una petición](#12-flujo-de-una-petición)
+  - [1.3 Plan de direccionamiento](#13-plan-de-direccionamiento)
+  - [1.4 Inventario de instancias EC2 (9)](#14-inventario-de-instancias-ec2-9)
+  - [1.5 Grupos de seguridad (diseño)](#15-grupos-de-seguridad-diseño)
+  - [1.6 Decisiones de diseño y justificación](#16-decisiones-de-diseño-y-justificación)
+  - [1.7 Punto único de falla y estado compartido](#17-punto-único-de-falla-y-estado-compartido)
+  - [1.8 Estimación de costos](#18-estimación-de-costos)
+- [2. Implementación por fases](#2-implementación-por-fases)
+  - [Fase 0 — Preparación](#fase-0--preparación)
+  - [Fase 1 — Red base](#fase-1--red-base)
+  - [Fase 2 — NAT](#fase-2--nat)
+  - [Fase 3 — DNS BIND9](#fase-3--dns-bind9)
+  - [Fase 4 — Base de datos y NFS](#fase-4--base-de-datos-y-nfs)
+  - [Fase 5 — WordPress](#fase-5--wordpress)
+  - [Fase 6 — Balanceadores HAProxy](#fase-6--balanceadores-haproxy)
+- [3. Pruebas experimentales](#3-pruebas-experimentales)
+  - [Verificación previa: registro en SSM a través del NAT](#verificación-previa-registro-en-ssm-a-través-del-nat)
+  - [N1 — Solicitud HTTP desde una instancia privada](#n1--solicitud-http-desde-una-instancia-privada)
+  - [N2 — Asociaciones de direcciones y puertos con conntrack](#n2--asociaciones-de-direcciones-y-puertos-con-conntrack)
+  - [N3 — Deshabilitar IP forwarding en una instancia NAT](#n3--deshabilitar-ip-forwarding-en-una-instancia-nat)
+  - [N4 — Conexión iniciada desde la subred privada vs. conexión entrante no solicitada](#n4--conexión-iniciada-desde-la-subred-privada-vs-conexión-entrante-no-solicitada)
+  - [D1 — Consultas autoritativas (SOA, NS, A, CNAME) y delegación pública](#d1--consultas-autoritativas-soa-ns-a-cname-y-delegación-pública)
+  - [D2 — Actualización de zona en primario y transferencia al secundario](#d2--actualización-de-zona-en-primario-y-transferencia-al-secundario)
+  - [D3 — Caída del servidor DNS primario y continuidad del secundario](#d3--caída-del-servidor-dns-primario-y-continuidad-del-secundario)
+  - [D4 — Consultas repetidas a www: orden de registros A, TTL y caché](#d4--consultas-repetidas-a-www-orden-de-registros-a-ttl-y-caché)
+  - [D5 — Balanceador caído sigue anunciado por DNS](#d5--balanceador-caído-sigue-anunciado-por-dns)
+  - [B1 — Distribución de solicitudes entre las dos instancias WordPress](#b1--distribución-de-solicitudes-entre-las-dos-instancias-wordpress)
+  - [B2 — Una instancia WordPress deja de estar disponible](#b2--una-instancia-wordpress-deja-de-estar-disponible)
+- [4. Análisis de protocolos y capturas de tráfico](#4-análisis-de-protocolos-y-capturas-de-tráfico)
+  - [4.1 Resolución DNS (UDP/53) y consulta interna a AmazonProvidedDNS](#41-resolución-dns-udp53-y-consulta-interna-a-amazonprovideddns)
+  - [4.2 Handshake TCP, petición HTTP y cierre de conexión (Cliente ↔ Balanceador ↔ Backend)](#42-handshake-tcp-petición-http-y-cierre-de-conexión-cliente--balanceador--backend)
+  - [4.3 Trazabilidad de IP real del cliente (X-Forwarded-For)](#43-trazabilidad-de-ip-real-del-cliente-x-forwarded-for)
+  - [4.4 Conectividad ICMP y aislamiento por Security Groups](#44-conectividad-icmp-y-aislamiento-por-security-groups)
+  - [4.5 Traducción de direcciones (NAT / PAT)](#45-traducción-de-direcciones-nat--pat)
+- [5. Problemas encontrados y recomendaciones](#5-problemas-encontrados-y-recomendaciones)
+- [6. Conclusiones](#6-conclusiones)
+- [7. Referencias](#7-referencias)
+- [Lista de tablas](#lista-de-tablas)
+- [Lista de figuras](#lista-de-figuras)
+
+## Lista de tablas
+
+- Tabla 1. 1.3 Plan de direccionamiento
+- Tabla 2. 1.4 Inventario de instancias EC2 (9)
+- Tabla 3. 1.5 Grupos de seguridad (diseño)
+- Tabla 4. 1.6 Decisiones de diseño y justificación
+- Tabla 5. 1.7 Punto único de falla y estado compartido
+- Tabla 6. 1.8 Estimación de costos
+- Tabla 7. Fase 1 — Red base — Tablas de rutas
+- Tabla 8. Fase 1 — Red base — Security Groups
+- Tabla 9. Fase 1 — Red base — Elastic IPs
+- Tabla 10. Fase 3 — DNS BIND9 — Opciones globales
+- Tabla 11. Fase 3 — DNS BIND9 — Primario/secundario y transferencia de zona
+- Tabla 12. Fase 3 — DNS BIND9 — Verificación
+- Tabla 13. Fase 4 — Base de datos y NFS
+- Tabla 14. Fase 4 — Base de datos y NFS — Tres capas de control de acceso a la DB
+- Tabla 15. Fase 4 — Base de datos y NFS — Verificación
+- Tabla 16. Fase 5 — WordPress — Estado compartido
+- Tabla 17. Fase 5 — WordPress — Apache
+- Tabla 18. Fase 5 — WordPress — Verificación
+- Tabla 19. Fase 6 — Balanceadores HAProxy — Configuración
+- Tabla 20. 3. Pruebas experimentales
+- Tabla 21. N1 — Solicitud HTTP desde una instancia privada
+- Tabla 22. N2 — Asociaciones de direcciones y puertos con conntrack — Evidencia
+- Tabla 23. N3 — Deshabilitar IP forwarding en una instancia NAT — Evidencia
+- Tabla 24. N4 — Conexión iniciada desde la subred privada vs. conexión entrante no solicitada — Comparación
+- Tabla 25. 5. Problemas encontrados y recomendaciones
+
+## Lista de figuras
+
+Las figuras son las capturas de la carpeta `evidencias/`, numeradas en el orden en que se citan por primera vez.
+
+- Figura 1. Fase 1 — Red base — `evidencias/fase1/resource-map-vpc.png`
+- Figura 2. Fase 1 — Red base — `evidencias/fase1/security-groups.png`
+- Figura 3. Fase 1 — Red base — `evidencias/fase1/elastic-ips.png`
+- Figura 4. Fase 2 — NAT — `evidencias/fase2/nat-a-nft-ruleset.png`
+- Figura 5. Fase 2 — NAT — `evidencias/fase2/nat-a-ip-forward.png`
+- Figura 6. Fase 2 — NAT — `evidencias/fase2/nat-b-nft-ruleset.png`
+- Figura 7. Fase 2 — NAT — `evidencias/fase2/nat-b-ip-forward.png`
+- Figura 8. Fase 2 — NAT — `evidencias/fase2/rt-private-a-routes.png`
+- Figura 9. Fase 3 — DNS BIND9 — `evidencias/fase3/godaddy-hostnames-glue.png`
+- Figura 10. Fase 3 — DNS BIND9 — `evidencias/fase3/godaddy-nameservers.png`
+- Figura 11. Fase 3 — DNS BIND9 — `evidencias/fase3/tld-delegacion-dig.png`
+- Figura 12. Fase 3 — DNS BIND9 — `evidencias/fase3/ns1-soa.png`
+- Figura 13. Fase 3 — DNS BIND9 — `evidencias/fase3/ns1-ns.png`
+- Figura 14. Fase 3 — DNS BIND9 — `evidencias/fase3/ns1-www.png`
+- Figura 15. Fase 3 — DNS BIND9 — `evidencias/fase3/ns1-tienda-cname.png`
+- Figura 16. Fase 3 — DNS BIND9 — `evidencias/fase3/ns2-soa.png`
+- Figura 17. Fase 3 — DNS BIND9 — `evidencias/fase3/ns2-www.png`
+- Figura 18. Fase 3 — DNS BIND9 — `evidencias/fase3/axfr-denegado-y-sin-recursion.png`
+- Figura 19. Fase 4 — Base de datos y NFS — `evidencias/fase4/db-setup-resumen.png`
+- Figura 20. Fase 4 — Base de datos y NFS — `evidencias/fase4/wp1-conexion-db.png`
+- Figura 21. Fase 4 — Base de datos y NFS — `evidencias/fase4/wp2-conexion-db.png`
+- Figura 22. Fase 4 — Base de datos y NFS — `evidencias/fase4/nfs-compartido-wp2.png`
+- Figura 23. Fase 4 — Base de datos y NFS — `evidencias/fase4/ns1-db-timeout.png`
+- Figura 24. Fase 5 — WordPress — `evidencias/fase5/wp1-setup-resumen.png`
+- Figura 25. Fase 5 — WordPress — `evidencias/fase5/wp2-setup-resumen.png`
+- Figura 26. Fase 5 — WordPress — `evidencias/fase5/wp1-media-import.png`
+- Figura 27. Fase 5 — WordPress — `evidencias/fase5/wp2-media-compartida.png`
+- Figura 28. Fase 5 — WordPress — `evidencias/fase5/wp1-setup-resumen-v1.png`
+- Figura 29. Fase 5 — WordPress — `evidencias/fase5/wp2-setup-resumen-v1.png`
+- Figura 30. Fase 6 — Balanceadores HAProxy — `evidencias/fase6/lb1-setup-resumen.png`
+- Figura 31. Fase 6 — Balanceadores HAProxy — `evidencias/fase6/lb2-setup-resumen.png`
+- Figura 32. Fase 6 — Balanceadores HAProxy — `evidencias/fase6/ec2-9-instancias.png`
+- Figura 33. Fase 6 — Balanceadores HAProxy — `evidencias/fase6/ssm-9-nodos-online.png`
+- Figura 34. Verificación previa: registro en SSM a través del NAT — `evidencias/fase2/ssm-managed-nodes.png`
+- Figura 35. N1 — Solicitud HTTP desde una instancia privada — `evidencias/fase2/n1-wp1-addr-route-curl.png`
+- Figura 36. N1 — Solicitud HTTP desde una instancia privada — `evidencias/fase2/n1-nat-a-tcpdump.png`
+- Figura 37. N2 — Asociaciones de direcciones y puertos con conntrack — `evidencias/fase2/n2-nat-a-conntrack.png`
+- Figura 38. N2 — Asociaciones de direcciones y puertos con conntrack — `evidencias/fase2/n2-nat-b-conntrack.png`
+- Figura 39. N3 — Deshabilitar IP forwarding en una instancia NAT — `evidencias/fase2/n3-wp2-log.png`
+- Figura 40. N4 — Conexión iniciada desde la subred privada vs. conexión entrante no solicitada — `evidencias/fase2/n4-curl-externo-timeout.png`
+- Figura 41. N4 — Conexión iniciada desde la subred privada vs. conexión entrante no solicitada — `evidencias/fase2/n4-tcpdump-nat-a.png`
+- Figura 42. D1 — Consultas autoritativas (SOA, NS, A, CNAME) y delegación pública — `evidencias/fase7/dig.png`
+- Figura 43. D1 — Consultas autoritativas (SOA, NS, A, CNAME) y delegación pública — `evidencias/fase7/dig-trace.png`
+- Figura 44. D1 — Consultas autoritativas (SOA, NS, A, CNAME) y delegación pública — `evidencias/fase3/dig-trace-www.png`
+- Figura 45. D2 — Actualización de zona en primario y transferencia al secundario — `evidencias/fase7/d2-antes.png`
+- Figura 46. D2 — Actualización de zona en primario y transferencia al secundario — `evidencias/fase7/d2-ns1-serial.png`
+- Figura 47. D2 — Actualización de zona en primario y transferencia al secundario — `evidencias/fase7/d2-prueba-serial.png`
+- Figura 48. D2 — Actualización de zona en primario y transferencia al secundario — `evidencias/fase7/d2-journal-ns1.png`
+- Figura 49. D2 — Actualización de zona en primario y transferencia al secundario — `evidencias/fase7/d2-journal-ns2.png`
+- Figura 50. D3 — Caída del servidor DNS primario y continuidad del secundario — `evidencias/fase7/d3-ns1-stoped.png`
+- Figura 51. D3 — Caída del servidor DNS primario y continuidad del secundario — `evidencias/fase7/d3-dig-ns1-timeout.png`
+- Figura 52. D3 — Caída del servidor DNS primario y continuidad del secundario — `evidencias/fase7/d3-restablished.png`
+- Figura 53. D4 — Consultas repetidas a www: orden de registros A, TTL y caché — `evidencias/fase7/d4recursive-autoritary-ttl.png`
+- Figura 54. D4 — Consultas repetidas a www: orden de registros A, TTL y caché — `evidencias/fase7/DNStest.png`
+- Figura 55. D5 — Balanceador caído sigue anunciado por DNS — `evidencias/fase7/d5-lb1-failed.png`
+- Figura 56. B1 — Distribución de solicitudes entre las dos instancias WordPress — `evidencias/fase6/b1-curl-lb1-lb2.png`
+- Figura 57. B1 — Distribución de solicitudes entre las dos instancias WordPress — `evidencias/fase6/b1-curl-www-dns.png`
+- Figura 58. B1 — Distribución de solicitudes entre las dos instancias WordPress — `evidencias/fase6/b1-navegador-lb1.png`
+- Figura 59. B1 — Distribución de solicitudes entre las dos instancias WordPress — `evidencias/fase6/b1-navegador-lb2.png`
+- Figura 60. B1 — Distribución de solicitudes entre las dos instancias WordPress — `evidencias/fase6/b1-stats-lb1.png`
+- Figura 61. B1 — Distribución de solicitudes entre las dos instancias WordPress — `evidencias/fase6/b1-stats-lb2.png`
+- Figura 62. B1 — Distribución de solicitudes entre las dos instancias WordPress — `evidencias/fase6/b2-stats-wp1-down-lb1.png`
+- Figura 63. B1 — Distribución de solicitudes entre las dos instancias WordPress — `evidencias/fase6/b2-stats-wp1-down-lb2.png`
+- Figura 64. B2 — Una instancia WordPress deja de estar disponible — `evidencias/fase6/b2-curl-con-wp1-caido.png`
+- Figura 65. B2 — Una instancia WordPress deja de estar disponible — `evidencias/fase6/b2-journal-down-up-stats-restaurado.png`
+- Figura 66. 4.2 Handshake TCP, petición HTTP y cierre de conexión (Cliente ↔ Balanceador ↔ Backend) — `evidencias/fase7/d6-tcp-handshake.png`
+- Figura 67. 4.2 Handshake TCP, petición HTTP y cierre de conexión (Cliente ↔ Balanceador ↔ Backend) — `evidencias/fase7/handshake-tcp.webp`
+- Figura 68. 4.2 Handshake TCP, petición HTTP y cierre de conexión (Cliente ↔ Balanceador ↔ Backend) — `evidencias/fase7/tcp-wp1.png`
+- Figura 69. 4.3 Trazabilidad de IP real del cliente (X-Forwarded-For) — `evidencias/fase7/Forwarded-for_wp1.png`
+- Figura 70. 4.4 Conectividad ICMP y aislamiento por Security Groups — `evidencias/fase7/icmp-tcp-lb1.png`
+
+---
+
+## Introducción
+
+XYZ S.A. es una empresa colombiana ficticia de cosméticos, con sedes en Medellín, Bogotá y Bucaramanga, que necesita publicar su sitio web corporativo con alta disponibilidad. Este proyecto despliega ese sitio en **WordPress** [1] sobre **Amazon Web Services** [2], pero sin usar los servicios gestionados que resuelven la red por el usuario (NAT Gateway, Elastic Load Balancing, Route 53). En su lugar, cada función de red se construye y configura sobre instancias EC2 con Ubuntu Server: una VPC con dos zonas de disponibilidad, **NAT propio** con `nftables`, **balanceadores HAProxy** [3] autogestionados y **DNS autoritativo BIND9** [4] primario/secundario con delegación pública de un dominio real.
+
+El objetivo es entender en la práctica cómo interactúan los protocolos de la pila TCP/IP en una arquitectura de varias capas: direccionamiento IP privado y público, traducción de direcciones, resolución de nombres, establecimiento de conexiones TCP, peticiones HTTP y estado compartido entre servidores. Para ello, además de desplegar el servicio, se ejecutan pruebas controladas de falla y recuperación (N1–N4, D1–D5, B1–B2) y se capturan y analizan paquetes en cada capa.
+
+El documento está organizado así: la sección 1 presenta la arquitectura y las decisiones de diseño; la sección 2, la implementación por fases; la sección 3, las pruebas experimentales; la sección 4, el análisis de protocolos con capturas de tráfico; la sección 5, los problemas encontrados y las recomendaciones; la sección 6, las conclusiones, y la sección 7, las referencias.
 
 ---
 
@@ -33,13 +201,15 @@ Despliegue del sitio web corporativo de **XYZ S.A.** (cosméticos) en **WordPres
 ```
 
 ### 1.2 Flujo de una petición
-1. El cliente resuelve `www.<dominio>`: su resolvedor recursivo sigue la delegación del TLD hacia `ns1`/`ns2` (BIND9), que responden con **dos registros A** (EIP de lb1 y lb2) → **DNS Round Robin**.
+1. El cliente resuelve `www.<dominio>`: su resolvedor recursivo sigue la delegación del TLD hacia `ns1`/`ns2` (BIND9), que responden con **dos registros A** (EIP de lb1 y lb2) → **DNS Round Robin** [5], [6].
 2. El cliente abre TCP:80 contra uno de los balanceadores. El IGW traduce la EIP a la IP privada del LB.
 3. HAProxy elige un backend (`roundrobin`) entre wp1 y wp2, verificando su salud con health checks.
 4. WordPress consulta MariaDB en `xyz-db` y lee archivos subidos desde el montaje NFS.
 5. La respuesta muestra la **IP privada** del nodo WordPress que atendió la petición.
 
 ### 1.3 Plan de direccionamiento
+
+*Tabla 1. 1.3 Plan de direccionamiento.*
 
 | Subred | CIDR | AZ | Tipo | Ruta por defecto |
 |---|---|---|---|---|
@@ -48,9 +218,11 @@ Despliegue del sitio web corporativo de **XYZ S.A.** (cosméticos) en **WordPres
 | xyz-public-b | 10.0.2.0/24 | us-east-2b | Pública | 0.0.0.0/0 → IGW |
 | xyz-private-b | 10.0.12.0/24 | us-east-2b | Privada | 0.0.0.0/0 → ENI de xyz-nat-b |
 
-Todas las tablas incluyen la ruta implícita `10.0.0.0/16 → local`.
+Todas las tablas incluyen la ruta implícita `10.0.0.0/16 → local`. El bloque 10.0.0.0/16 pertenece al espacio de direcciones privadas definido en el RFC 1918 [7].
 
 ### 1.4 Inventario de instancias EC2 (9)
+
+*Tabla 2. 1.4 Inventario de instancias EC2 (9).*
 
 | Nombre | Rol | Subred | IP privada | IP pública | Instance ID |
 |---|---|---|---|---|---|
@@ -68,6 +240,8 @@ Todas: Ubuntu Server 26.04 LTS (AMI Quick Start de Canonical; el enunciado exige
 
 ### 1.5 Grupos de seguridad (diseño)
 
+*Tabla 3. 1.5 Grupos de seguridad (diseño).*
+
 | SG | Entrada permitida | Origen |
 |---|---|---|
 | xyz-sg-dns | UDP 53, TCP 53 | 0.0.0.0/0 |
@@ -82,22 +256,26 @@ Salida: todo permitido (por defecto). **Ningún SG abre SSH (22)**: la administr
 
 ### 1.6 Decisiones de diseño y justificación
 
+*Tabla 4. 1.6 Decisiones de diseño y justificación.*
+
 | Decisión | Justificación |
 |---|---|
 | Región us-east-2, dos AZ | Región fija del proyecto AWS (nueva experiencia, asignada por país); una AZ caída deja operativa la otra mitad (NAT, LB, DNS, WP). |
 | t3.micro | Elegible en el plan gratuito; suficiente para carga académica. |
-| Ubuntu Server 26.04 LTS | Es la AMI de Ubuntu que ofrece por defecto el *Quick Start* de EC2. Cumple el requisito "24.04 o superior", es LTS (soporte estándar hasta 2031) y trae versiones recientes (p. ej. PHP 8.5; nftables como firewall por defecto). Las 9 instancias usan la misma AMI. |
+| Ubuntu Server 26.04 LTS | Es la AMI de Ubuntu que ofrece por defecto el *Quick Start* de EC2. Cumple el requisito "24.04 o superior", es LTS (soporte estándar hasta 2031) y trae versiones recientes (p. ej. PHP 8.5; nftables como firewall por defecto). Las 9 instancias usan la misma AMI [8]. |
 | NAT propio por AZ | Requisito; además evita tráfico entre AZ y que una AZ dependa de la otra para salir a Internet. |
 | HAProxy | Health checks activos y página de estadísticas para evidenciar el balanceo. |
 | Sin afinidad de sesión | Requisito B1: cada petición debe poder ir a cualquier nodo. |
 | NFS en la instancia DB | Comparte `wp-content/uploads` sin instancia adicional (límite de 9). La DB ya es SPOF; concentrar ahí el estado lo hace explícito. |
 | Salts idénticos en ambos WP | Las sesiones de WordPress se validan con cookies firmadas; con los mismos salts y la misma DB, cualquier nodo acepta la sesión. |
 | EIP solo en ns1/ns2/lb1/lb2 | Necesitan IP fija (glue records y registros A). La cuota por defecto es 5 EIP. |
-| SSM en lugar de SSH | Requisito; no se exponen puertos de administración. Las privadas alcanzan los endpoints de SSM a través de su NAT. |
+| SSM en lugar de SSH | Requisito; no se exponen puertos de administración [9]. Las privadas alcanzan los endpoints de SSM a través de su NAT. |
 
 ### 1.7 Punto único de falla y estado compartido
 
 Para que dos nodos WordPress sirvan el mismo sitio, todo su **estado** debe estar fuera de ellos o ser idéntico en ambos:
+
+*Tabla 5. 1.7 Punto único de falla y estado compartido.*
 
 | Estado | Dónde vive | Cómo se comparte |
 |---|---|---|
@@ -109,6 +287,8 @@ Para que dos nodos WordPress sirvan el mismo sitio, todo su **estado** debe esta
 **Punto único de falla:** `xyz-db` concentra la base de datos y los archivos. Si falla, ambos WordPress dejan de servir contenido dinámico, aunque el DNS, los balanceadores y los nodos web sigan en pie. Además, la DB está en la AZ `us-east-2a`: una falla de esa zona afecta al sitio completo, aunque wp2 y lb2 estén en `us-east-2b`. La redundancia del diseño cubre la capa de presentación (DNS, LB, web), no la de datos. Mitigaciones fuera de alcance: replicación MariaDB primario/réplica (o Galera) en la otra AZ, Amazon RDS Multi-AZ, Amazon EFS o S3 para los medios, y copias de seguridad programadas (`mariadb-dump` + snapshots EBS).
 
 ### 1.8 Estimación de costos
+
+*Tabla 6. 1.8 Estimación de costos.*
 
 | Recurso | Cálculo | USD/hora |
 |---|---|---|
@@ -142,6 +322,8 @@ Con ~5 días de despliegue el costo esperado es ≈ 16 USD, dentro de los 100 US
 
 **Tablas de rutas.**
 
+*Tabla 7. Fase 1 — Red base — Tablas de rutas.*
+
 | Tabla | Subredes asociadas | Rutas |
 |---|---|---|
 | xyz-rt-public | xyz-public-a, xyz-public-b | 10.0.0.0/16 → local; 0.0.0.0/0 → xyz-igw |
@@ -157,6 +339,8 @@ Evidencia: `evidencias/fase1/resource-map-vpc.png`.
 
 **Security Groups** (todos en `xyz-vpc`; la regla de salida es la default, todo permitido):
 
+*Tabla 8. Fase 1 — Red base — Security Groups.*
+
 | SG | ID | Entrada |
 |---|---|---|
 | xyz-sg-lb | sg-0c9f84365bae19198 | TCP 80 desde 0.0.0.0/0 · TCP 8404 desde la IP del equipo · ICMP desde 0.0.0.0/0 |
@@ -165,13 +349,15 @@ Evidencia: `evidencias/fase1/resource-map-vpc.png`.
 | xyz-sg-wp | sg-0260dc2f52e738c66 | TCP 80 desde xyz-sg-lb · ICMP desde 10.0.0.0/16 |
 | xyz-sg-db | sg-00410bb2e8ec6b83c | TCP 3306 y TCP 2049 desde xyz-sg-wp · ICMP desde 10.0.0.0/16 |
 
-Los SG son *stateful*: el tráfico de respuesta de una conexión permitida pasa sin regla adicional. En wp y db el origen es otro SG (mínimo privilegio independiente de las IPs). El SG del NAT debe aceptar el tráfico de las subredes privadas porque los paquetes reenviados atraviesan su ENI. Ningún SG abre SSH.
+Los SG son *stateful* [2]: el tráfico de respuesta de una conexión permitida pasa sin regla adicional. En wp y db el origen es otro SG (mínimo privilegio independiente de las IPs). El SG del NAT debe aceptar el tráfico de las subredes privadas porque los paquetes reenviados atraviesan su ENI. Ningún SG abre SSH.
 
 Evidencia: `evidencias/fase1/security-groups.png`.
 
 **Rol IAM.** `xyz-ec2-ssm-role` (entidad de confianza: EC2; política `AmazonSSMManagedInstanceCore`). Permite que el agente SSM se registre sin credenciales almacenadas en las instancias.
 
 **Elastic IPs** (se reservan antes de lanzar las instancias para conocer de antemano las IPs que van en los glue records y en los registros A):
+
+*Tabla 9. Fase 1 — Red base — Elastic IPs.*
 
 | Nombre | IPv4 pública | Allocation ID | Uso |
 |---|---|---|---|
@@ -192,8 +378,8 @@ Evidencia: `evidencias/fase1/elastic-ips.png`.
 
 **Configuración en Linux** (procedimiento en `scripts/nat/setup-nat.sh`):
 
-1. `net.ipv4.ip_forward = 1`, persistente en `/etc/sysctl.d/99-nat.conf`, para que el kernel enrute paquetes que no van dirigidos a él.
-2. `nftables` con dos tablas:
+1. `net.ipv4.ip_forward = 1`, persistente en `/etc/sysctl.d/99-nat.conf`, para que el kernel enrute paquetes IP [10] que no van dirigidos a él.
+2. `nftables` [11] con dos tablas:
 
 ```
 table inet filter {
@@ -211,7 +397,7 @@ table ip nat {
 }
 ```
 
-- **`masquerade`** es un SNAT dinámico: reemplaza la IP de origen privada por la IP de la interfaz del NAT y, si hace falta, el puerto de origen (PAT). Así varias instancias comparten una sola dirección. La tabla de conntrack guarda cada asociación para deshacer la traducción en las respuestas.
+- **`masquerade`** es un SNAT dinámico (NAPT) [12]: reemplaza la IP de origen privada por la IP de la interfaz del NAT y, si hace falta, el puerto de origen (PAT). Así varias instancias comparten una sola dirección. La tabla de conntrack guarda cada asociación para deshacer la traducción en las respuestas.
 - **Cadena `forward` con política `drop`:** solo se reenvían conexiones nuevas que vienen de la subred privada de la misma AZ, más las respuestas (`established,related`). Una conexión entrante no solicitada no tiene entrada en conntrack, así que se descarta.
 - Las instancias tienen una sola interfaz (`ens5`), así que el tráfico entra y sale por ella.
 
@@ -234,7 +420,9 @@ Evidencias: `evidencias/fase2/nat-a-nft-ruleset.png`, `nat-a-ip-forward.png`, `n
 
 El servidor del TLD `.online` (`ns10.trs-dns.org`) responde **sin** el flag `aa`, porque no es autoritativo para la zona. En la sección AUTHORITY entrega los dos NS y en ADDITIONAL los glue, con un TTL de 900 s fijado por el registro del TLD.
 
-**Opciones globales** (`/etc/bind/named.conf.options`, iguales en ambos servidores):
+**Opciones globales** [4] (`/etc/bind/named.conf.options`, iguales en ambos servidores):
+
+*Tabla 10. Fase 3 — DNS BIND9 — Opciones globales.*
 
 | Opción | Valor | Motivo |
 |---|---|---|
@@ -273,17 +461,21 @@ tienda  IN CNAME www
 
 **Primario/secundario y transferencia de zona.**
 
+*Tabla 11. Fase 3 — DNS BIND9 — Primario/secundario y transferencia de zona.*
+
 | | ns1 (primario) | ns2 (secundario) |
 |---|---|---|
 | Declaración | `type primary; file "/etc/bind/zones/db.…";` | `type secondary; primaries { 10.0.1.10; }; file "/var/cache/bind/db.…"; masterfile-format text;` |
 | AXFR | `allow-transfer { 10.0.2.10; };` | `allow-transfer { none; };` |
 | NOTIFY | `notify explicit; also-notify { 10.0.2.10; };` | `notify no;` |
 
-La transferencia y el NOTIFY usan las **IPs privadas** (red local de la VPC). Si se usaran los NS de la zona, el tráfico iría a la EIP, saldría por el IGW con la EIP del remitente como origen, y el secundario lo rechazaría por no venir de su primario declarado (ver problema P6). `masterfile-format text` deja legible la copia del secundario, que por defecto se guarda en formato binario `raw`.
+La transferencia (AXFR/IXFR) [13] y el NOTIFY [14] usan las **IPs privadas** (red local de la VPC). Si se usaran los NS de la zona, el tráfico iría a la EIP, saldría por el IGW con la EIP del remitente como origen, y el secundario lo rechazaría por no venir de su primario declarado (ver problema P6). `masterfile-format text` deja legible la copia del secundario, que por defecto se guarda en formato binario `raw`.
 
 Log de ns2 al arrancar: `Transfer started` → `transfer of 'xyzcosmetics.online/IN' from 10.0.1.10#53: connected using 10.0.1.10#53` → `Transfer completed: 1 messages, 13 records, 323 bytes` → `transferred serial 2026111801`.
 
 **Verificación** (desde un PC externo, con `+norec` para exigir una respuesta autoritativa):
+
+*Tabla 12. Fase 3 — DNS BIND9 — Verificación.*
 
 | Consulta | Servidor | Resultado |
 |---|---|---|
@@ -301,7 +493,7 @@ Evidencias: `evidencias/fase3/godaddy-hostnames-glue.png`, `godaddy-nameservers.
 
 **Instancia.** `xyz-db` (private-a, 10.0.11.20, sin IP pública, SG `xyz-sg-db`). Accede a Internet (paquetes y SSM) a través de nat-a. La configuración se hizo con `scripts/db/setup-db.sh`. La contraseña de `wpuser` se pide por teclado y se guarda solo en `secrets.env` (no versionado; plantilla en `secrets.env.example`).
 
-**MariaDB** (`/etc/mysql/mariadb.conf.d/60-xyz.cnf`, que se lee después de `50-server.cnf` y sobrescribe sus valores):
+**MariaDB** [15] (`/etc/mysql/mariadb.conf.d/60-xyz.cnf`, que se lee después de `50-server.cnf` y sobrescribe sus valores):
 
 ```
 [mysqld]
@@ -314,12 +506,14 @@ skip-name-resolve = 1
 - Base `wordpress` (`utf8mb4`). Se crea el usuario `wpuser` **dos veces**, `wpuser@10.0.11.10` y `wpuser@10.0.12.10`, con `ALL PRIVILEGES` solo sobre `wordpress.*`. MariaDB identifica a un usuario por *nombre + host de origen*, así que desde cualquier otra IP el usuario no existe.
 - `root` conserva la autenticación `unix_socket`: solo entra con `sudo mariadb` desde la propia instancia. Se eliminan los usuarios anónimos y la base `test`.
 
-**NFS (NFSv4)** — `/etc/exports`:
+**NFS (NFSv4)** [16] — `/etc/exports`:
 
 ```
 /srv/nfs/wp-uploads 10.0.11.10(rw,sync,no_subtree_check,all_squash,anonuid=33,anongid=33) \
                     10.0.12.10(rw,sync,no_subtree_check,all_squash,anonuid=33,anongid=33)
 ```
+
+*Tabla 13. Fase 4 — Base de datos y NFS.*
 
 | Opción | Efecto |
 |---|---|
@@ -330,6 +524,8 @@ skip-name-resolve = 1
 
 **Tres capas de control de acceso a la DB:**
 
+*Tabla 14. Fase 4 — Base de datos y NFS — Tres capas de control de acceso a la DB.*
+
 | Capa | 3306 (MariaDB) | 2049 (NFS) |
 |---|---|---|
 | Security Group `xyz-sg-db` | Solo desde instancias con `xyz-sg-wp` | Solo desde instancias con `xyz-sg-wp` |
@@ -337,6 +533,8 @@ skip-name-resolve = 1
 | Red | Subred privada sin IP pública: no es direccionable desde Internet | Ídem |
 
 **Verificación:**
+
+*Tabla 15. Fase 4 — Base de datos y NFS — Verificación.*
 
 | Prueba | Desde | Resultado |
 |---|---|---|
@@ -353,9 +551,11 @@ Evidencias: `evidencias/fase4/db-setup-resumen.png`, `wp1-conexion-db.png`, `wp2
 
 **Instancias.** `xyz-wp1` (private-a, 10.0.11.10) y `xyz-wp2` (private-b, 10.0.12.10), sin IP pública y con SG `xyz-sg-wp` (TCP 80 solo desde `xyz-sg-lb`). Se configuraron con `scripts/wordpress/setup-wordpress.sh`, un único archivo que incluye el mu-plugin y el contenido. Se ejecuta primero en wp1, que instala WordPress en la DB compartida, y después en wp2, que detecta la instalación existente y solo configura el nodo.
 
-**Pila de software:** Apache 2.4 con `mod_php` (PHP 8.5, MPM prefork) y WordPress **7.1.5** en español (`es_ES`), instalado con **WP-CLI**. El mismo código está en el disco local de cada nodo.
+**Pila de software:** Apache 2.4 con `mod_php` (PHP 8.5, MPM prefork) y WordPress **7.1.5** en español (`es_ES`) [1], instalado con **WP-CLI** [17]. El mismo código está en el disco local de cada nodo.
 
 **Estado compartido** (ver §1.7):
+
+*Tabla 16. Fase 5 — WordPress — Estado compartido.*
 
 | Elemento | Implementación |
 |---|---|
@@ -370,6 +570,8 @@ Evidencias: `evidencias/fase4/db-setup-resumen.png`, `wp1-conexion-db.png`, `wp2
 - **`WP_CACHE = false`** y sin plugins de caché.
 
 **Apache** (`/etc/apache2/sites-available/xyz-wordpress.conf`; se deshabilitó `000-default`):
+
+*Tabla 17. Fase 5 — WordPress — Apache.*
 
 | Directiva | Propósito |
 |---|---|
@@ -388,6 +590,8 @@ Evidencias: `evidencias/fase4/db-setup-resumen.png`, `wp1-conexion-db.png`, `wp2
 
 **Verificación:**
 
+*Tabla 18. Fase 5 — WordPress — Verificación.*
+
 | Prueba | wp1 | wp2 |
 |---|---|---|
 | `wp core version` | 7.1.5 | 7.1.5 |
@@ -399,13 +603,15 @@ Evidencias: `evidencias/fase4/db-setup-resumen.png`, `wp1-conexion-db.png`, `wp2
 
 Las peticiones de prueba se hicieron con `curl` local en cada nodo (`-H "Host: www.xyzcosmetics.online" http://127.0.0.1/`), porque `xyz-sg-wp` solo admite tráfico desde los balanceadores.
 
-Evidencias: `evidencias/fase5/wp1-setup-resumen.png`, `wp2-setup-resumen.png`, `wp1-media-import.png`, `wp2-media-compartida.png` (y `*-v1.png`, antes de corregir P8).
+Evidencias: `evidencias/fase5/wp1-setup-resumen.png`, `wp2-setup-resumen.png`, `wp1-media-import.png`, `wp2-media-compartida.png` y, antes de corregir P8, `wp1-setup-resumen-v1.png` y `wp2-setup-resumen-v1.png`.
 
 ### Fase 6 — Balanceadores HAProxy
 
-**Instancias.** `xyz-lb1` (public-a, 10.0.1.20, EIP 18.190.31.183) y `xyz-lb2` (public-b, 10.0.2.20, EIP 13.58.14.10): Ubuntu 26.04 LTS, `t3.micro`, sin key pair (acceso por SSM), SG `xyz-sg-lb`, rol `xyz-ec2-ssm-role`. Con ellas se completan las **9 instancias** (18 de los 20 vCPU de la cuota). Se lanzaron clonando `xyz-ns1` y `xyz-ns2` (misma subred pública, AMI y rol) y cambiando nombre, SG e IP privada fija; la EIP se asoció después. Se configuraron con `scripts/haproxy/setup-haproxy.sh` (HAProxy 3.2.25), que identifica el nodo por su IP privada y pide la contraseña de la página de estadísticas (no se guarda en el repositorio).
+**Instancias.** `xyz-lb1` (public-a, 10.0.1.20, EIP 18.190.31.183) y `xyz-lb2` (public-b, 10.0.2.20, EIP 13.58.14.10): Ubuntu 26.04 LTS, `t3.micro`, sin key pair (acceso por SSM), SG `xyz-sg-lb`, rol `xyz-ec2-ssm-role`. Con ellas se completan las **9 instancias** (18 de los 20 vCPU de la cuota). Se lanzaron clonando `xyz-ns1` y `xyz-ns2` (misma subred pública, AMI y rol) y cambiando nombre, SG e IP privada fija; la EIP se asoció después. Se configuraron con `scripts/haproxy/setup-haproxy.sh` (HAProxy 3.2.25 [3]), que identifica el nodo por su IP privada y pide la contraseña de la página de estadísticas (no se guarda en el repositorio).
 
 **Configuración** (`/etc/haproxy/haproxy.cfg`, igual en ambos salvo el nombre):
+
+*Tabla 19. Fase 6 — Balanceadores HAProxy — Configuración.*
 
 | Directiva | Propósito |
 |---|---|
@@ -429,6 +635,8 @@ Evidencias: `evidencias/fase6/lb1-setup-resumen.png`, `lb2-setup-resumen.png`, `
 ## 3. Pruebas experimentales
 
 Para cada prueba: procedimiento, comandos, evidencia, interpretación y protocolos involucrados.
+
+*Tabla 20. 3. Pruebas experimentales.*
 
 | ID | Prueba | Estado |
 |---|---|---|
@@ -470,6 +678,8 @@ curl -s http://checkip.amazonaws.com
 - IP pública que observa el destino: **3.128.168.127**, que es la IPv4 pública de xyz-nat-a, no una IP de wp1.
 - Captura en nat-a (destino 52.5.79.118:80, que es checkip.amazonaws.com). Cada paquete aparece dos veces en la misma interfaz, antes y después del NAT:
 
+*Tabla 21. N1 — Solicitud HTTP desde una instancia privada.*
+
 | Fase | Paquete recibido de wp1 | Paquete reenviado por nat-a |
 |---|---|---|
 | SYN | `10.0.11.10.44862 > 52.5.79.118.80 [S]` | `10.0.1.30.44862 > 52.5.79.118.80 [S]` |
@@ -498,6 +708,8 @@ sudo conntrack -L -p tcp --dport 80
 
 **Evidencia** (`evidencias/fase2/n2-nat-a-conntrack.png`, `evidencias/fase2/n2-nat-b-conntrack.png`). Cada entrada tiene una tupla **original** (como salió el paquete del cliente, antes del NAT) y una tupla **de respuesta** (como vuelve desde Internet, después del NAT):
 
+*Tabla 22. N2 — Asociaciones de direcciones y puertos con conntrack — Evidencia.*
+
 | NAT | Cliente | Tupla original (antes del NAT) | Tupla de respuesta (después del NAT) |
 |---|---|---|---|
 | nat-a | wp1 | `src=10.0.11.10 sport=40000 → dst=52.5.79.118 dport=80` | `src=52.5.79.118 sport=80 → dst=10.0.1.30 dport=40000` |
@@ -522,6 +734,8 @@ sudo nohup bash -c 'nstat -az IpInAddrErrors > /var/tmp/n3-natb.log; sysctl -w n
 ```
 
 **Evidencia** (`evidencias/fase2/n3-wp2-log.png`, `evidencias/fase2/n3-natb-extracto.log`):
+
+*Tabla 23. N3 — Deshabilitar IP forwarding en una instancia NAT — Evidencia.*
 
 | Tramo | Hora | Lado de wp2 (`n3.log`) | Lado de nat-b (tcpdump) |
 |---|---|---|---|
@@ -550,11 +764,13 @@ sudo timeout 30 tcpdump -ni ens5 'tcp port 80 and not net 10.0.0.0/16'
 curl -v -m 5 http://3.128.168.127/
 ```
 
-**Evidencia** (`evidencias/fase2/n4-curl-externo-timeout.png`):
+**Evidencia** (`evidencias/fase2/n4-curl-externo-timeout.png`, `evidencias/fase2/n4-tcpdump-nat-a.png`):
 - PC externo: `Trying 3.128.168.127:80...` y luego `Connection timed out after 5001 milliseconds` (código 28). No hubo respuesta de ningún tipo, ni SYN-ACK ni RST.
-- nat-a: la captura `tcpdump -ni ens5 'tcp port 80 and not net 10.0.0.0/16'` no registra ningún paquete entrante desde Internet porque el Security Group descarta el SYN antes de alcanzar la interfaz `ens5`.
+- nat-a: mientras el PC externo repetía `curl -4 -m 5 -I http://3.128.168.127/`, la captura `sudo timeout -s INT 20 tcpdump -ni ens5 'tcp dst port 80 and not src net 10.0.0.0/16'` terminó con `0 packets captured`: ningún paquete del cliente llegó a la interfaz `ens5`, porque el Security Group descarta el SYN antes de entregarlo a la instancia.
 
 **Comparación.**
+
+*Tabla 24. N4 — Conexión iniciada desde la subred privada vs. conexión entrante no solicitada — Comparación.*
 
 | | Conexión saliente (N1) | Conexión entrante no solicitada (N4) |
 |---|---|---|
@@ -645,7 +861,7 @@ for LB in 18.190.31.183 13.58.14.10; do curl -s -m 5 -o /dev/null -w "$LB %{http
 
 **Interpretación.** Gracias a la delegación dual configurada en GoDaddy (`ns1` y `ns2` en distintas AZ) y al parámetro `expire = 604800` (7 días) del `SOA`, el secundario es completamente autónomo para responder consultas autoritativas durante una caída del primario, garantizando alta disponibilidad en la capa de resolución de nombres.
 
-**Protocolos.** DNS (UDP/TCP 53) e ICMP/TCP (`connection refused` al estar cerrado el puerto 53 en `ns1`).
+**Protocolos.** DNS (UDP/TCP 53) e **ICMP**: con `named` detenido, el kernel de `ns1` responde a la consulta UDP con un ICMP *destination unreachable / port unreachable* (tipo 3, código 3), que `dig` reporta como `connection refused`. En TCP, el equivalente sería un segmento RST.
 
 ### D4 — Consultas repetidas a `www`: orden de registros A, TTL y caché
 
@@ -662,9 +878,9 @@ done | sort | uniq -c
 **Evidencia** (`evidencias/fase7/d4recursive-autoritary-ttl.png`, `evidencias/fase7/DNStest.png`):
 - Contra el resolvedor recursivo (`@1.1.1.1`), en 20 consultas se obtuvo un reparto de **9** respuestas hacia `13.58.14.10` (`x-balanced-by: xyz-lb2`) y **9** hacia `18.190.31.183` (`x-balanced-by: xyz-lb1`) (más 2 transitorias durante inicialización/caché).
 - Contra el servidor autoritativo directo (`@3.134.251.219`), en 20 consultas se obtuvo **11** hacia `13.58.14.10` (`xyz-lb2`) y **9** hacia `18.190.31.183` (`xyz-lb1`), alternando el orden de los dos registros `A` (`13.58.14.10` / `18.190.31.183`) en respuestas consecutivas con TTL fijo de `300` s.
-- En un resolvedor recursivo, el TTL observado decrece segundo a segundo desde `300` hasta `0` mientras la respuesta permanece cacheada (RFC 1035), y aunque el recursivo reordena (round-robin) los registros en caché, no vuelve a consultar al autoritativo hasta que el TTL expira.
+- En un resolvedor recursivo, el TTL observado decrece segundo a segundo desde `300` hasta `0` mientras la respuesta permanece cacheada [6], y aunque el recursivo reordena (round-robin) los registros en caché, no vuelve a consultar al autoritativo hasta que el TTL expira.
 
-**Interpretación.** El DNS autoritativo implementa *DNS Round Robin* permutando el orden de los registros `A` con cada consulta (`rrset-order` cíclico en BIND9). Sin embargo, la granularidad del balanceo por DNS está limitada por el caching de los resolvedores intermedios y del sistema operativo cliente durante la ventana del TTL (300 s).
+**Interpretación.** El DNS autoritativo implementa *DNS Round Robin* entregando **ambos** registros `A` y variando su orden entre respuestas. El reparto no es una alternancia estricta (11/9 en 20 consultas, y varias respuestas seguidas con el mismo orden en la Fase 3), lo que coincide con un orden aleatorio más que con uno cíclico. El orden lo controla la opción `rrset-order` de BIND9 [4], que no se modificó. Los clientes suelen usar la primera dirección de la lista, así que el orden variable es lo que reparte la carga. Sin embargo, la granularidad del balanceo por DNS está limitada por el caching de los resolvedores intermedios y del sistema operativo cliente durante la ventana del TTL (300 s).
 
 **Protocolos.** DNS (UDP 53) y HTTP/1.1 (TCP 80).
 
@@ -687,7 +903,8 @@ done | sort | uniq -c
 **Evidencia** (`evidencias/fase7/d5-lb1-failed.png`):
 - `dig` contra `3.134.251.219` sigue entregando **ambas direcciones IP** (`13.58.14.10` y `18.190.31.183`).
 - `curl` directo a `18.190.31.183` falla con `exit=7` (*Failed to connect / Connection refused*), mientras `13.58.14.10` (`lb2`) responde `HTTP/1.1 200 OK`.
-- En el bucle de 20 peticiones: **9** cayeron en `13.58.14.10` y devolvieron código **`200`**, mientras que **10** cayeron en `18.190.31.183` y devolvieron **`000`** (fallo de conexión). Tras reiniciar HAProxy en `lb1`, el servicio volvió a responder `200`.
+- En el bucle de 20 peticiones: **9** cayeron en `13.58.14.10` y devolvieron **`200`**; **10** cayeron en `18.190.31.183` y devolvieron **`000`** (fallo de conexión), y en **1** la consulta `dig` no obtuvo respuesta a tiempo (IP vacía, `000`). Tras volver a iniciar HAProxy **en `xyz-lb1`** (sesión SSM), el servicio respondió `200`.
+- Nota sobre la captura: el `sudo systemctl start haproxy` que aparece con el error `Unit haproxy.service not found` se ejecutó por error en el WSL del PC y no en `xyz-lb1`; por eso la siguiente línea muestra `lb1 000`. El servicio se restableció después desde la sesión SSM de `xyz-lb1`.
 
 **Interpretación.** El DNS estándar (BIND9) es un protocolo de resolución de nombres estático sin *health checks* activos sobre los destinos de los registros `A`: desconoce si el servicio HTTP en `18.190.31.183:80` está operativo. Por ello sigue anunciando la IP caída y aproximadamente el 50 % de los intentos de conexión nuevos fallan (a menos que el navegador/cliente aplique *Happy Eyeballs* o reintentos sobre la segunda IP de la respuesta DNS). Esto contrasta directamente con B2, donde HAProxy sí realiza comprobaciones L4/L7 y retira automáticamente el backend fallido.
 
@@ -709,11 +926,11 @@ curl -sI http://13.58.14.10/   | grep -iE '^HTTP|x-served-by|x-balanced-by|cache
 dig -4 +short www.xyzcosmetics.online
 ```
 
-**Evidencia** (`evidencias/fase6/b1-curl-lb1-lb2.png`, `b1-curl-www-dns.png`, `b1-navegador-lb1.png`, `b1-navegador-lb2.png`):
+**Evidencia** (`evidencias/fase6/b1-curl-lb1-lb2.png`, `b1-curl-www-dns.png`, `b1-navegador-lb1.png`, `b1-navegador-lb2.png`, `b1-stats-lb1.png`, `b1-stats-lb2.png`):
 - Cada balanceador devolvió 10 respuestas alternando `xyz-wp1 · 10.0.11.10` y `xyz-wp2 · 10.0.12.10` (5 y 5).
 - `curl -I`: `200 OK`, `cache-control: no-store`, `x-served-by: xyz-wp… ` y `x-balanced-by: xyz-lb1` / `xyz-lb2` según el balanceador consultado.
 - `dig -4 +short www.xyzcosmetics.online` devuelve las dos EIP (18.190.31.183 y 13.58.14.10). Seis solicitudes a `www` dieron wp2, wp2, wp1, wp1, wp2, wp2: sin patrón estricto, porque el cliente elige una de las dos IP y cada balanceador lleva **su propio contador** de roundrobin.
-- Estadísticas de HAProxy justo antes de B2 (`evidencias/fase6/b2-stats-wp1-down-lb1.png`, `-lb2.png`, columna *Sessions → Total*): lb1 wp1 = 86 y wp2 = 86; lb2 wp1 = 66 y wp2 = 67. El reparto de las 172 y 133 solicitudes fue prácticamente exacto.
+- Estadísticas de HAProxy al terminar B1 (`evidencias/fase6/b1-stats-lb1.png`, `b1-stats-lb2.png`, columna *Sessions → Total*): lb1 wp1 = 82 y wp2 = 81 (163 en total); lb2 wp1 = 61 y wp2 = 61 (122). Ambos servidores `UP` con `L7OK/200`. Justo antes de que wp1 cayera en B2 los contadores eran lb1 86/86 y lb2 66/67 (`b2-stats-wp1-down-lb1.png`, `b2-stats-wp1-down-lb2.png`). El reparto fue prácticamente exacto en ambos balanceadores.
 
 **Interpretación.**
 1. Con un solo cliente, `roundrobin` alterna en cada solicitud porque cada una abre una conexión nueva y no hay afinidad (sin cookies ni hash de IP). Si hubiera varios clientes simultáneos, el orden se entremezclaría, pero el reparto total seguiría siendo parejo.
@@ -740,11 +957,11 @@ done
 sudo journalctl --since "-4hours" --no-pager | grep -iE 'haproxy.*wp1'
 ```
 
-**Evidencia** (`evidencias/fase6/b2-stats-wp1-down-lb1.png`, `b2-stats-wp1-down-lb2.png`, `b2-curl-con-wp1-caido.png`, `b2-journal-down-up.png`, `b2-stats-wp1-restaurado-lb1.png`, `-lb2.png`):
-- En las estadísticas de **ambos** balanceadores wp1 pasó a `DOWN` (rojo) con `LastChk = L4CON in 0ms` (la conexión TCP al puerto 80 fue rechazada, porque Apache estaba detenido) y wp2 siguió en `UP` (`L7OK/200`). El backend quedó en `1/1` servidores activos. El `DOWN` se registró hacia las 12:08.
+**Evidencia** (`evidencias/fase6/b2-stats-wp1-down-lb1.png`, `b2-stats-wp1-down-lb2.png`, `b2-curl-con-wp1-caido.png`, `b2-journal-down-up-stats-restaurado.png`). Las horas de esta prueba son hora local de Colombia (UTC−5); los registros de las instancias están en UTC (por ejemplo, `17:12` UTC = `12:12` local):
+- En las estadísticas de **ambos** balanceadores wp1 pasó a `DOWN` (rojo) con `LastChk = L4CON in 0ms` (la conexión TCP al puerto 80 fue rechazada, porque Apache estaba detenido) y wp2 siguió en `UP` (`L7OK/200`). El backend quedó en `1/1` servidores activos. Las capturas muestran wp1 `DOWN` desde hacía 1m53s (lb1) y 2m24s (lb2): el `DOWN` se registró hacia las 12:08.
 - Con wp1 caído (`12:11:18`), las 20 solicitudes consecutivas (10 a `18.190.31.183` y 10 a `13.58.14.10`) fueron servidas al 100 % por `xyz-wp2 · IPv4 privada 10.0.12.10`, sin errores ni timeouts para el cliente (`evidencias/fase6/b2-curl-con-wp1-caido.png`).
-- Los registros del sistema (`journalctl`) y el panel de estadísticas (`evidencias/fase6/b2-journal-down-up-stats-restaurado.png`) confirman la transición de estado de `wordpress/wp1` a `DOWN` por error de capa 4 (`L4CON in 0ms`) y su posterior retorno automático a `UP` tras iniciar Apache.
-- Tras restaurar, wp1 volvió a `UP` y a recibir solicitudes en round-robin. Los contadores acumulados lo reflejan: wp1 registra `Dwn = 1` y `Dwntme = 6m18s` (lb1) y `6m17s` (lb2), y los totales posteriores (lb1: wp1 96 / wp2 107; lb2: wp1 78 / wp2 82) muestran que wp2 absorbió todo el tráfico durante la ventana de indisponibilidad.
+- El panel de lb1 después de iniciar Apache (`evidencias/fase6/b2-journal-down-up-stats-restaurado.png`) muestra wp1 de nuevo activo, sin intervención en HAProxy. En la columna *Total*, wp1 se quedó en 86 (el valor del momento de la caída) y wp2 pasó de 86 a 96: las 10 solicitudes que recibió lb1 durante la caída fueron todas a wp2. El fragmento de `journalctl` de esa captura solo muestra los accesos a `/stats`; la transición `DOWN → UP` se lee en el panel.
+- Tras restaurar, wp1 volvió a `UP` y a recibir solicitudes en round-robin. Según el panel consultado más tarde (esa captura no está en el repositorio), wp1 registra `Dwn = 1` y `Dwntme = 6m18s` (lb1) y `6m17s` (lb2), y los totales posteriores (lb1: wp1 96 / wp2 107; lb2: wp1 78 / wp2 82) muestran que wp2 absorbió todo el tráfico durante la ventana de indisponibilidad.
 
 **Interpretación.**
 1. **Detección.** HAProxy verifica cada 2 s (`inter 2s`); tras 2 fallos seguidos (`fall 2`) marca el servidor `DOWN`, así que tarda unos 4–6 s. Una petición que llegue justo antes de esa marca podría elegir wp1, pero `option redispatch` + `retries 3` la reintentan en wp2 y el cliente no ve el error.
@@ -766,22 +983,22 @@ Se realizaron capturas de paquetes con `tcpdump` en las interfaces `ens5` de los
 ### 4.2 Handshake TCP, petición HTTP y cierre de conexión (Cliente ↔ Balanceador ↔ Backend)
 - **Evidencia:** `evidencias/fase7/d6-tcp-handshake.png`, `evidencias/fase7/handshake-tcp.webp`, `evidencias/fase7/tcp-wp1.png`.
 - **Análisis en `xyz-lb1` (`d6-tcp-handshake.png`):**
-  1. **Three-way handshake (Cliente ↔ LB):**
+  1. **Three-way handshake (Cliente ↔ LB)** [18]**:**
      - `SYN`: `186.87.10.152.4031 > 10.0.1.20.80: Flags [S], seq 2167957936, win 64240, options [mss 1460,...]`.
      - `SYN-ACK`: `10.0.1.20.80 > 186.87.10.152.4031: Flags [S.], seq 474272013, ack 2167957937, win 62643, options [mss 8961,...]`.
      - `ACK`: `186.87.10.152.4031 > 10.0.1.20.80: Flags [.], ack 1`.
-  2. **Capa de aplicación HTTP/1.1:** El cliente envía `HTTP: HEAD / HTTP/1.1` (`78` bytes de payload) y HAProxy devuelve `HTTP/1.1 200 OK` (`429` bytes) incluyendo las cabeceras `x-served-by: xyz-wp1 10.0.11.10`, `cache-control: no-store` y `x-balanced-by: xyz-lb1`.
+  2. **Capa de aplicación HTTP/1.1** [19], [20]**:** El cliente envía `HTTP: HEAD / HTTP/1.1` (`78` bytes de payload) y HAProxy devuelve `HTTP/1.1 200 OK` (`429` bytes) incluyendo las cabeceras `x-served-by: xyz-wp1 10.0.11.10`, `cache-control: no-store` y `x-balanced-by: xyz-lb1`.
   3. **Cierre ordenado (Four-way teardown):** Intercambio de segmentos `FIN-ACK` (`Flags [F.]`) y `ACK` en ambos sentidos (`seq 79, ack 430` y `seq 430, ack 80`).
 - **Análisis en `xyz-wp1` (`tcp-wp1.png`):** Confirma que HAProxy abre una **segunda conexión TCP independiente** desde su IP privada `10.0.1.20` hacia `10.0.11.10:80` (y `10.0.12.10:80`) con `mss 8961` (Jumbo Frames internos de la VPC), realizando peticiones `GET / HTTP/1.1` con respuestas `200 OK`.
 
 ### 4.3 Trazabilidad de IP real del cliente (`X-Forwarded-For`)
 - **Evidencia:** `evidencias/fase7/Forwarded-for_wp1.png`.
-- **Análisis:** Dado que la conexión TCP en Apache proviene de la IP privada del balanceador (`10.0.1.20` o `10.0.2.20`), HAProxy inserta la cabecera HTTP `X-Forwarded-For` (`option forwardfor`). Apache la registra en `/var/log/apache2/access.log` mediante el `LogFormat` personalizado, conservando la IP pública original del cliente (`186.87.10.152`) para auditoría.
+- **Análisis:** Dado que la conexión TCP en Apache proviene de la IP privada del balanceador (`10.0.1.20` o `10.0.2.20`), HAProxy inserta la cabecera HTTP `X-Forwarded-For` (`option forwardfor`). Apache la registra en `/var/log/apache2/xyz-access.log` mediante el `LogFormat` personalizado `xyz` del VirtualHost (`%h %{X-Forwarded-For}i …`, Fase 5), conservando la IP pública original del cliente (`186.87.10.152`) para auditoría.
 
 ### 4.4 Conectividad ICMP y aislamiento por Security Groups
 - **Evidencia:** `evidencias/fase7/icmp-tcp-lb1.png` (y pruebas desde `xyz-wp1`).
 - **Análisis:**
-  - **ICMP (`ping`):** Desde `xyz-lb1` hacia `10.0.11.10` (`wp1`) y `10.0.12.10` (`wp2`) se obtiene 0 % de pérdida de paquetes con latencias promedio de `0.237 ms` (misma AZ `us-east-2a`) y `0.798 ms` (inter-AZ hacia `us-east-2b`). Desde `xyz-wp1` hacia `10.0.12.10`, `10.0.11.20` (`db`), `10.0.1.20` (`lb1`) y `1.1.1.1` (a través de `nat-a`), 0 % de pérdida (`1.968 ms` hacia Internet).
+  - **ICMP (`ping`)** [21]**:** Desde `xyz-lb1` hacia `10.0.11.10` (`wp1`) y `10.0.12.10` (`wp2`) se obtiene 0 % de pérdida de paquetes con latencias promedio de `0.237 ms` (misma AZ `us-east-2a`) y `0.798 ms` (inter-AZ hacia `us-east-2b`). Desde `xyz-wp1` hacia `10.0.12.10`, `10.0.11.20` (`db`), `10.0.1.20` (`lb1`) y `1.1.1.1` (a través de `nat-a`), 0 % de pérdida (`1.968 ms` hacia Internet).
   - **TCP y aislamiento:** `lb1` conecta por TCP 80 a `wp1` y `wp2` (`http 200`), pero el intento TCP hacia `10.0.11.20:3306` (`db`) resulta `BLOQUEADO`, demostrando que `xyz-sg-db` solo admite conexiones provenientes de `xyz-sg-wp` y cumple el principio de mínimo privilegio entre capas.
 
 ### 4.5 Traducción de direcciones (NAT / PAT)
@@ -790,6 +1007,8 @@ Se realizaron capturas de paquetes con `tcpdump` en las interfaces `ens5` de los
 
 
 ## 5. Problemas encontrados y recomendaciones
+
+*Tabla 25. 5. Problemas encontrados y recomendaciones.*
 
 | # | Problema | Causa | Solución / lección |
 |---|---|---|---|
@@ -803,26 +1022,58 @@ Se realizaron capturas de paquetes con `tcpdump` en las interfaces `ens5` de los
 | P8 | La franja del home mostraba `IPv4 privada 127.0.0.1` | La prueba local se conectaba a 127.0.0.1, y `SERVER_ADDR` es la dirección local de esa conexión | Si `SERVER_ADDR` es loopback, el mu-plugin obtiene la IP de la interfaz de salida con un socket UDP conectado a 10.0.0.2. Lección: la IP "del servidor" depende de por cuál interfaz llegó la conexión |
 | P9 | `http://<EIP>:8404/stats` daba `ERR_CONNECTION_TIMED_OUT` aunque HAProxy escuchaba en `0.0.0.0:8404` y el puerto 80 respondía | El SG `xyz-sg-lb` solo permite el 8404 desde la IP pública del equipo (/32) y la regla no coincidía con la IP vigente (las IP públicas del equipo cambian). Un SG descarta sin responder, por eso se ve un timeout y no un `connection refused` | Se actualizó la regla con la IP actual. `curl -4 -m 5 -I http://<EIP>:8404/stats` debe responder `401 Unauthorized` (puerto abierto, falta autenticación). Lección: si cambia la red o la IP, hay que actualizar la regla; no se abrió el 8404 a 0.0.0.0/0 |
 
-## 6. Referencias
+## 6. Conclusiones
 
-[1] J. Postel, "Internet Protocol," Internet Engineering Task Force (IETF), RFC 791, Sep. 1981. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc791
+1. **Es posible reemplazar los servicios de red gestionados de AWS por componentes propios** sobre EC2, con las 9 instancias exigidas: dos NAT con `nftables`, dos balanceadores HAProxy y dos servidores BIND9 sirven el sitio WordPress con redundancia en dos zonas de disponibilidad. El precio es más configuración y más responsabilidad operativa, por ejemplo deshabilitar *Source/Destination Check* o mantener las reglas de los Security Groups.
+2. **El NAT de origen es asimétrico por diseño** (N1–N4): permite que las subredes privadas inicien conexiones hacia Internet gracias al estado de `conntrack`, e impide las conexiones entrantes no solicitadas. Junto con los Security Groups, la ausencia de IP pública y la cadena `forward` con política `drop`, forma una defensa en capas. Cada subred privada depende del NAT de su propia AZ: si falla ese NAT, como en N3, solo pierde salida esa mitad de la infraestructura.
+3. **El DNS autoritativo propio funciona con delegación pública real**: los *glue records* rompen la dependencia circular de `ns1`/`ns2.xyzcosmetics.online`, el secundario se sincroniza por NOTIFY y transferencia de zona en milisegundos cuando sube el serial (D2), y sigue respondiendo con autoridad cuando cae el primario (D3).
+4. **El DNS Round Robin reparte la carga, pero no da alta disponibilidad por sí solo** (D4–D5): BIND sigue anunciando la IP de un balanceador caído, y cerca de la mitad de las conexiones nuevas fallan mientras dure el TTL. HAProxy, en cambio, detecta la caída de un WordPress con *health checks* en segundos y la oculta por completo a los clientes (B2). Las dos técnicas se complementan: el DNS distribuye entre balanceadores y los balanceadores distribuyen y protegen el *backend*.
+5. **Escalar horizontalmente la capa web exige sacar el estado de los nodos**: base de datos compartida, uploads por NFS, *salts* idénticos y código igual en ambos nodos (sin cambios desde el panel). Así cualquier nodo puede atender cualquier petición sin afinidad de sesión, y la franja con la IP privada lo demuestra en cada recarga (B1).
+6. **La alta disponibilidad lograda cubre la presentación, no los datos**: `xyz-db` es un punto único de falla para todo el sitio. Es la principal limitación del diseño, y la primera mejora sería replicar la base de datos y el almacenamiento de archivos en la otra zona.
+7. **Lecciones operativas**: con IP elásticas (NAT 1:1 en el IGW) las instancias no conocen su IP pública, así que la comunicación interna debe usar IPs privadas (problema P6). Las pruebas que cortan conectividad deben ejecutarse desacopladas de la sesión de administración (P4). SSM Session Manager permite administrar las 9 instancias sin exponer SSH ni usar un *bastion*.
 
-[2] J. Postel, "Transmission Control Protocol," Internet Engineering Task Force (IETF), RFC 793, Sep. 1981. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc793
+Como trabajo futuro se recomienda: replicación de MariaDB y almacenamiento compartido redundante, **HTTPS** en los balanceadores (el sitio hoy solo sirve HTTP), firma DNSSEC de la zona, comprobaciones de salud externas que retiren del DNS un balanceador caído, y automatizar la infraestructura como código.
 
-[3] P. Mockapetris, "Domain Names - Implementation and Specification," Internet Engineering Task Force (IETF), RFC 1035, Nov. 1987. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc1035
+## 7. Referencias
 
-[4] Y. Rekhter, B. Moskowitz, D. Karrenberg, G. J. de Groot, y E. Lear, "Address Allocation for Private Internets," Internet Engineering Task Force (IETF), RFC 1918, Feb. 1996. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc1918
+[1] WordPress.org, "Advanced Administration Handbook," WordPress Developer Resources, 2026. [En línea]. Disponible: https://developer.wordpress.org/advanced-administration/
 
-[5] P. Vixie, "A Mechanism for Prompt Notification of Zone Changes (DNS NOTIFY)," Internet Engineering Task Force (IETF), RFC 1996, Ago. 1996. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc1996
+[2] Amazon Web Services, "Amazon Virtual Private Cloud User Guide," AWS Documentation, 2026. [En línea]. Disponible: https://docs.aws.amazon.com/vpc/latest/userguide/
 
-[6] P. Srisuresh y M. Holdrege, "IP Network Address Translator (NAT) Terminology and Considerations," Internet Engineering Task Force (IETF), RFC 2663, Ago. 1999. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc2663
+[3] W. Tarreau, "HAProxy Configuration Manual (Version 3.2)," HAProxy Technologies, 2026. [En línea]. Disponible: https://docs.haproxy.org/
 
-[7] R. Fielding y J. Reschke, "Hypertext Transfer Protocol (HTTP/1.1): Message Syntax and Routing," Internet Engineering Task Force (IETF), RFC 7230, Jun. 2014. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc7230
+[4] Internet Systems Consortium (ISC), "BIND 9 Administrator Reference Manual," ISC Documentation, 2026. [En línea]. Disponible: https://bind9.readthedocs.io/
 
-[8] T. Haynes y D. Noveck, "Network File System (NFS) Version 4 Protocol," Internet Engineering Task Force (IETF), RFC 7530, Mar. 2015. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc7530
+[5] P. Mockapetris, "Domain Names - Concepts and Facilities," Internet Engineering Task Force (IETF), RFC 1034, Nov. 1987. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc1034
 
-[9] Amazon Web Services, "Amazon Virtual Private Cloud User Guide," AWS Documentation, 2026. [En línea]. Disponible: https://docs.aws.amazon.com/vpc/latest/userguide/
+[6] P. Mockapetris, "Domain Names - Implementation and Specification," Internet Engineering Task Force (IETF), RFC 1035, Nov. 1987. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc1035
 
-[10] Internet Systems Consortium (ISC), "BIND 9 Administrator Reference Manual," ISC Documentation, 2026. [En línea]. Disponible: https://bind9.readthedocs.io/
+[7] Y. Rekhter, B. Moskowitz, D. Karrenberg, G. J. de Groot y E. Lear, "Address Allocation for Private Internets," Internet Engineering Task Force (IETF), RFC 1918, Feb. 1996. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc1918
 
-[11] W. Tarreau, "HAProxy Configuration Manual (Version 3.2)," HAProxy Technologies, 2026. [En línea]. Disponible: https://docs.haproxy.org/
+[8] Canonical Ltd., "Ubuntu Server documentation," 2026. [En línea]. Disponible: https://documentation.ubuntu.com/server/
+
+[9] Amazon Web Services, "AWS Systems Manager Session Manager," AWS Systems Manager User Guide, 2026. [En línea]. Disponible: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager.html
+
+[10] J. Postel, "Internet Protocol," Internet Engineering Task Force (IETF), RFC 791, Sep. 1981. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc791
+
+[11] The Netfilter Project, "nftables wiki," 2026. [En línea]. Disponible: https://wiki.nftables.org/
+
+[12] P. Srisuresh y M. Holdrege, "IP Network Address Translator (NAT) Terminology and Considerations," Internet Engineering Task Force (IETF), RFC 2663, Ago. 1999. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc2663
+
+[13] E. Lewis y A. Hoenes, "DNS Zone Transfer Protocol (AXFR)," Internet Engineering Task Force (IETF), RFC 5936, Jun. 2010. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc5936
+
+[14] P. Vixie, "A Mechanism for Prompt Notification of Zone Changes (DNS NOTIFY)," Internet Engineering Task Force (IETF), RFC 1996, Ago. 1996. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc1996
+
+[15] MariaDB Foundation, "MariaDB Server Documentation," 2026. [En línea]. Disponible: https://mariadb.com/kb/en/documentation/
+
+[16] T. Haynes y D. Noveck, "Network File System (NFS) Version 4 Protocol," Internet Engineering Task Force (IETF), RFC 7530, Mar. 2015. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc7530
+
+[17] WP-CLI, "WP-CLI Commands," WordPress Developer Resources, 2026. [En línea]. Disponible: https://developer.wordpress.org/cli/commands/
+
+[18] W. Eddy, Ed., "Transmission Control Protocol (TCP)," Internet Engineering Task Force (IETF), RFC 9293, Ago. 2022. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc9293
+
+[19] R. Fielding, M. Nottingham y J. Reschke, Eds., "HTTP Semantics," Internet Engineering Task Force (IETF), RFC 9110, Jun. 2022. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc9110
+
+[20] R. Fielding, M. Nottingham y J. Reschke, Eds., "HTTP/1.1," Internet Engineering Task Force (IETF), RFC 9112, Jun. 2022. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc9112
+
+[21] J. Postel, "Internet Control Message Protocol," Internet Engineering Task Force (IETF), RFC 792, Sep. 1981. [En línea]. Disponible: https://www.rfc-editor.org/rfc/rfc792
